@@ -188,8 +188,6 @@ def compute_clip_pairwise_scores_from_files(images_folder, prompts):
     files = sorted([f for f in os.listdir(images_folder) if f.endswith(".png")])[: len(prompts)]
     for fn in files:
         im = Image.open(os.path.join(images_folder, fn))
-        if im.mode != "RGB":
-            im = im.convert("RGB")
         im_inputs = clip_processor(images=im, return_tensors="pt").to(DEVICE)
         f = clip_model.get_image_features(**im_inputs)
         f = F.normalize(f, dim=-1).cpu().numpy()
@@ -240,9 +238,6 @@ def compute_prdc_and_clip_and_save(model_name, gen_folder, prompts, gt_paths, sa
     real_feats, fake_feats = [], []
     for p in gt_paths:
         im = Image.open(p)
-        print(p)
-        if im.mode != "RGB":
-            im = im.convert("RGB")
         inputs = clip_processor(images=im, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
             f = clip_model.get_image_features(**inputs)
