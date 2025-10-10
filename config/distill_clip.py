@@ -1,6 +1,15 @@
 # File: config/distill_clip.py
 import ml_collections
 
+# from huggingface_hub import snapshot_download
+
+# snapshot_download(
+#     "stabilityai/stable-diffusion-xl-base-1.0",
+#     pretrained.revision = "main"
+#     resume_download=True,
+#     max_workers=1,   # fewer parallel threads → less chance of timeout
+# )
+
 def get_config():
     config = ml_collections.ConfigDict()
 
@@ -23,7 +32,8 @@ def get_config():
     config.pretrained = pretrained = ml_collections.ConfigDict()
     
     config.training_mode = "prompt"        # Stable Diffusion text-prompt
-    pretrained.model = "stabilityai/stable-diffusion-xl-base-1.0"
+    # pretrained.model = "stabilityai/stable-diffusion-xl-base-1.0"
+    pretrained.model = "/media/external20/amirhossein_tighkhorshid/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
     # pretrained.model = "stabilityai/stable-diffusion-xl-base-1.0"
 
     # config.training_mode = "unconditional" # CIFAR-10 unconditional
@@ -94,6 +104,27 @@ def get_config():
     # Beta for KL penalty, from Equation (3). The paper uses 0.04.
     config.train.kl_beta = 0.04 
     # -----------------------------
-    
+
+
+# ----- Progressive Distillation -----
+
+    # --- existing content (keep everything you already have) ---
+    # ...
+    config.train.learning_rate = 1e-5
+    # ...
+
+    # ===== ADD THIS NEW SECTION =====
+    config.distill = ml_collections.ConfigDict()
+
+    # Number of sampling steps per stage of progressive distillation
+    # (the paper uses this halving schedule)
+    config.distill.steps_list = [50, 25, 12, 5]
+
+    # Number of gradient updates (iterations) for each distillation stage
+    # You can increase to 50000+ for high-quality results;
+    # smaller values like 5000 are good for debugging.
+    config.distill.updates_per_stage = 5
+
+    # =================================
 
     return config
