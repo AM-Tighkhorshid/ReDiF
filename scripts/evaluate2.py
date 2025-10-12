@@ -17,13 +17,13 @@ import argparse
 # Args
 # --------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", choices=["coco", "laion"], default="laion", help="Dataset type to evaluate on")
+parser.add_argument("--dataset", choices=["coco", "laion"], default="coco", help="Dataset type to evaluate on")
 parser.add_argument("--split", choices=["val", "test"], default="val", help="Dataset split to evaluate on")
 parser.add_argument("--coco_root", default="coco_dataset", help="Root folder of COCO dataset")
 parser.add_argument("--laion_root", default="laion_dataset", help="Root folder of LAION dataset")
 parser.add_argument("--num_images", type=int, default=100, help="Number of images to evaluate")
 parser.add_argument("--teacher_model", default="output/distill_clip/teacher_model", help="Teacher model directory")
-parser.add_argument("--student_model", default="PPO_clip_dino_text_image_aesthetic_kl_1.0_coco_prompts/student_model", help="Student model directory")
+parser.add_argument("--student_model", default="GRPO_clip_dino_text_image_aesthetic_kl_1.0_coco_prompts/student_model", help="Student model directory")
 parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
 parser.add_argument("--student_steps", type=int, default=5, help="Student diffusion steps")
 

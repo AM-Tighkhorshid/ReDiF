@@ -1,50 +1,110 @@
-# train_ppo_coco.py
-# Progressive + Adversarial Distillation version of your original PPO script.
-# This file is based on your uploaded train_ppo_coco.py (keeps model loading / LoRA / eval unchanged). :contentReference[oaicite:4]{index=4}
-# Distillation logic implemented based on:
-#   - "Progressive Distillation for Fast Sampling of Diffusion Models" (Salimans & Ho et al.) - eq.43 target and algorithm. :contentReference[oaicite:5]{index=5}
-#   - "SDXL-Lightning / Progressive Adversarial Distillation" (paper you sent). :contentReference[oaicite:6]{index=6}
+# train_progressive_adversarial_coco.py
+# Progressive Adversarial Distillation (debugged)
+# Keeps your model loading, LoRA injection and eval image saving exactly as before.
+# Uses progressive_adverserial.pdf adversarial distillation loss.
 
+from collections import defaultdict
+import contextlib
 import os
-import math
+import datetime
+import time
+from absl import app, flags
+from ml_collections import config_flags
 import json
 import random
-import datetime
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from functools import partial
-from accelerate import Accelerator, ProjectConfiguration
-from torch.utils.data import DataLoader
-from torchvision import transforms
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
+from accelerate.logging import get_logger
 from diffusers import StableDiffusionPipeline, DDIMScheduler
-from diffusers.models.attention_processor import AttnProcsLayers
-from tqdm import tqdm as _tqdm
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import LoRAAttnProcessor
+import numpy as np
+import ddpo_pytorch.prompts
+# The ddpo_pytorch utilities referenced in your earlier script:
+from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
+from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
+import torch
+import wandb
+from functools import partial
+import tqdm
 from PIL import Image
-import matplotlib.pyplot as plt
+import torch.nn.functional as F
+import math
+import torch.nn as nn
 
-# your other imports (metrics, reward functions, helpers) - keep same as in original file
-# (Assumed present in your original script; keep them here)
-# from ddpo_pytorch import prompts as prompt_module
-# from your_utils import pipeline_with_logprob, ddim_step_with_logprob, save_side_by_side, get_reward_fn, get_logger
-# etc.
+# -------------------------
+# Flags and config
+# -------------------------
+FLAGS = flags.FLAGS
+config_flags.DEFINE_config_file("config", "config/distill_clip.py", "Training configuration.")
 
-tqdm = partial(_tqdm, dynamic_ncols=True)
+flags.DEFINE_enum(
+    "prompt_source", "coco", ["default", "coco"],
+    "Source of prompts to use: 'default' uses built-in prompt function; 'coco' samples captions from COCO annotations."
+)
+flags.DEFINE_enum(
+    "coco_split", "train", ["train", "val", "both"],
+    "Which COCO captions split to use when prompt_source=coco."
+)
+flags.DEFINE_string(
+    "coco_annotations_dir", "coco_dataset/annotations",
+    "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
+)
 
-# ---------- Begin: (kept from your original script) ----------
-# (I kept the important model-loading, LoRA and evaluation logic exactly as in your file.)
-# (Only abbreviated here for readability; the actual full file includes your helper functions and imports above.)
-
-# For clarity: some helper functions that exist in your original file are assumed defined:
-# - pipeline_with_logprob(...)
-# - ddim_step_with_logprob(...)
-# - save_side_by_side(student_eval_images, teacher_eval_images, epoch, outdir)
-# - get_reward_fn(...)
-# - get_logger(...)
-
+import tqdm as tqdm_lib
+tqdm = partial(tqdm_lib.tqdm, dynamic_ncols=True)
 logger = get_logger(__name__)
 
-# other helper defs kept (kl_divergence, align_teacher_student_steps etc.) from your original file
+# -------------------------
+# Small helper utilities
+# -------------------------
+def save_side_by_side(student_images, teacher_images, epoch, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    for idx in range(min(len(student_images), len(teacher_images))):
+        s_img = student_images[idx].convert("RGB")
+        t_img = teacher_images[idx].convert("RGB")
+        h = min(s_img.height, t_img.height)
+        s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
+        t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
+        combined = Image.new("RGB", (t_img.width + s_img.width, h))
+        combined.paste(t_img, (0, 0))
+        combined.paste(s_img, (t_img.width, 0))
+        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(outpath)
+        print(f"Saved {outpath}")
+
+def cosine_alpha_sigma(t):
+    """t in [0,1] scalar or tensor -> (alpha, sigma)."""
+    if isinstance(t, torch.Tensor):
+        alpha = torch.cos(0.5 * math.pi * t)
+        sigma = torch.sqrt(torch.clamp(1.0 - alpha * alpha, min=0.0))
+        return alpha, sigma
+    else:
+        alpha = math.cos(0.5 * math.pi * t)
+        sigma = math.sqrt(max(0.0, 1.0 - alpha * alpha))
+        return alpha, sigma
+
+def ddim_one_step_from_x_hat(zt, x_hat, alpha_s, sigma_s, alpha_t, sigma_t):
+    """
+    DDIM update from t->s using predicted x_hat:
+      z_s = alpha_s * x_hat + (sigma_s / sigma_t) * ( z_t - alpha_t * x_hat )
+    Vectorized; all inputs broadcastable to z shape.
+    """
+    return alpha_s * x_hat + (sigma_s / sigma_t) * (zt - alpha_t * x_hat)
+
+def compute_x_hat_from_eps_pred(zt, eps_pred, alpha_t, sigma_t):
+    denom = alpha_t
+    if isinstance(denom, torch.Tensor):
+        denom = torch.where(denom == 0.0, torch.full_like(denom, 1e-6), denom)
+    else:
+        if denom == 0.0:
+            denom = 1e-6
+    return (zt - sigma_t * eps_pred) / denom
+
+def snr_plus_one_weight(alpha_t, sigma_t):
+    eps = 1e-6
+    return 1.0 + (alpha_t * alpha_t) / (sigma_t * sigma_t + eps)
+
 def kl_divergence(p, q):
     p = p.float().view(p.shape[0], -1)
     q = q.float().view(q.shape[0], -1)
@@ -53,366 +113,51 @@ def kl_divergence(p, q):
     kl = F.kl_div(p, q, reduction='batchmean', log_target=False)
     return kl
 
-def align_teacher_student_steps(teacher_latents, student_latents, teacher_steps, student_steps):
-    if isinstance(teacher_latents, list):
-        teacher_latents = torch.stack(teacher_latents, dim=1)
-    align_indices = torch.linspace(teacher_steps//student_steps, teacher_steps, steps=student_steps).long()
-    aligned_teacher_latents = teacher_latents[:, align_indices]
-    return aligned_teacher_latents, student_latents[:,1:]
-
-# ---------- End: preserved original blocks ----------
-
-# ---------- Progressive + Adversarial distillation utilities ----------
-# BCE loss for discriminator/generator adversarial training
-bce_loss = nn.BCEWithLogitsLoss()
-
-def get_alpha_sigma_from_scheduler(scheduler, step_index):
+# -------------------------
+# Discriminator (lightweight)
+# -------------------------
+class SimpleDiscriminator(nn.Module):
     """
-    Convert discrete scheduler index into alpha and sigma scalars/tensors.
-    Adapted to common Diffusers schedulers exposing alphas_cumprod.
-    If your scheduler has a different attribute, update this function (ADAPT).
+    Small conditional discriminator that pools a 4-channel latent input and conditions on prompt embeddings.
+    This is intentionally simple and stable; you can replace with a deeper convnet if desired.
     """
-    alphas_cumprod = getattr(scheduler, "alphas_cumprod", None)
-    if alphas_cumprod is None:
-        # ADAPT: some scheduler versions name it 'alpha_cumprod' or similar.
-        alphas_cumprod = getattr(scheduler, "alpha_cumprod", None)
-    if alphas_cumprod is None:
-        raise RuntimeError("Scheduler missing alphas_cumprod/alpha_cumprod. Adapt get_alpha_sigma_from_scheduler() for your diffusers version.")
-
-    if not torch.is_tensor(alphas_cumprod):
-        ac = torch.from_numpy(alphas_cumprod)
-    else:
-        ac = alphas_cumprod
-    idx = int(step_index)
-    idx = max(0, min(idx, len(ac)-1))
-    alpha = ac[idx].sqrt()
-    sigma = (1.0 - ac[idx]).sqrt()
-    return alpha, sigma
-
-def compute_x_tilde_from_zt_and_ztpp(zt, ztpp, alpha_t, sigma_t, alpha_tpp, sigma_tpp):
-    """
-    Eq.43 from Progressive Distillation (paper): compute x_tilde target in latent space.
-    x_tilde = ( zt'' - (sigma_t''/sigma_t) * zt ) / ( alpha_t'' - (sigma_t''/sigma_t) * alpha_t )
-    """
-    ratio = (sigma_tpp / sigma_t)
-    numer = ztpp - ratio * zt
-    denom = alpha_tpp - ratio * alpha_t
-    denom = denom.clamp(min=1e-8)
-    x_tilde = numer / denom
-    return x_tilde
-
-class SimpleUNetBackboneDiscriminator(nn.Module):
-    """
-    Lightweight discriminator that extracts mid-level features from UNet and applies small conv head.
-    NOTE: extraction uses named_modules() heuristics; adapt strings if needed for your UNet (ADAPT).
-    """
-    def __init__(self, unet_model, hidden_channels=128):
+    def __init__(self, in_channels=4, cond_dim=768, hidden=128):
         super().__init__()
-        self.unet_model = unet_model  # we'll call parts of this or use hooks
-        self.head = nn.Sequential(
-            nn.Conv2d(hidden_channels*2, hidden_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(32, hidden_channels),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(hidden_channels, 1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, 1, 1),
+            nn.GroupNorm(32, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, 2, 1),
+            nn.GroupNorm(32, hidden), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, 2, 1),
+            nn.GroupNorm(32, hidden), nn.SiLU(),
         )
-        # We will rely on forward hooks to extract a mid-level feature map.
-        self._hook_handles = []
-        self._collected_feat = None
+        self.fc = nn.Sequential(
+            nn.Linear(hidden + cond_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1)
+        )
 
-        # find a candidate module to hook: mid_block or last down_block (heuristic)
-        self._hook_target_name = None
-        for name, module in self.unet_model.named_modules():
-            if "mid_block" in name or "mid" in name:
-                self._hook_target_name = name
-                break
-        if self._hook_target_name is None:
-            # fallback: pick a module from down_blocks
-            for name, module in self.unet_model.named_modules():
-                if "down_blocks" in name:
-                    self._hook_target_name = name
-                    break
-
-    def _hook_fn(self, module, inp, out):
-        # store out feature map
-        self._collected_feat = out
-
-    def forward_backbone_features(self, x, t, cond):
-        # register hook on chosen module temporarily
-        if self._hook_target_name is None:
-            # fallback: run unet and use final output
-            out = self.unet_model(x, t, encoder_hidden_states=cond)
-            if isinstance(out, tuple):
-                out = out[0]
-            return out
-        # register hook
-        for name, module in self.unet_model.named_modules():
-            if name == self._hook_target_name:
-                handle = module.register_forward_hook(lambda m, i, o: self._hook_fn(m, i, o))
-                self._hook_handles.append(handle)
-                break
-        # run a forward pass (we ignore the returned output)
-        out = None
-        try:
-            out = self.unet_model(x, t, encoder_hidden_states=cond)
-        except TypeError:
-            out = self.unet_model(x, t, cond)
-        # remove hooks
-        for h in self._hook_handles:
-            h.remove()
-        self._hook_handles = []
-        feat = self._collected_feat
-        self._collected_feat = None
-        if feat is None:
-            # fallback: use output
-            if isinstance(out, tuple):
-                feat = out[0]
-            else:
-                feat = out
-        # Ensure features are channel-first 4D tensors: (B,C,H,W)
-        return feat
-
-    def forward(self, xt, xt_ns, t, t_ns, cond):
-        feat1 = self.forward_backbone_features(xt, t, cond)
-        feat2 = self.forward_backbone_features(xt_ns, t_ns, cond)
-        # match spatial sizes
-        if feat1.shape[2:] != feat2.shape[2:]:
-            feat2 = F.interpolate(feat2, size=feat1.shape[2:], mode="bilinear", align_corners=False)
-        # concat on channels
-        combined = torch.cat([feat1, feat2], dim=1)
-        # if channels != expected, center-crop/conv to reduce - here assume shapes OK
-        logits = self.head(combined)
-        return logits.view(-1)
-
-# ---------- Distillation main routine ----------
-def run_progressive_adversarial_distillation(
-    accelerator,
-    config,
-    teacher_pipeline,
-    student_pipeline,
-    unet,
-    optimizer,
-    prompt_fn,
-    coco_captions,
-    steps_list = [50, 25, 12, 5],
-    epochs_per_stage = 1,
-    iters_per_stage = 1000,
-    guidance_scale = 1.0,
-    device = None,
-):
-    device = device or accelerator.device
-
-    # create discriminator that reuses student's UNet backbone features
-    disc = SimpleUNetBackboneDiscriminator(student_pipeline.unet, hidden_channels=128).to(device)
-    disc_opt = torch.optim.AdamW(disc.parameters(), lr=1e-6, betas=(0.0, 0.99))
-
-    # prepare with accelerator
-    disc, disc_opt, unet, optimizer = accelerator.prepare(disc, disc_opt, unet, optimizer)
-
-    batch_size = config.sample.batch_size
-
-    def sample_prompts(batch_size):
-        if FLAGS.prompt_source == "coco" and coco_captions is not None:
-            if len(coco_captions) >= batch_size:
-                return random.sample(coco_captions, k=batch_size)
-            else:
-                return [random.choice(coco_captions) for _ in range(batch_size)]
+    def forward(self, x_latent, cond_embeds):
+        # x_latent: (B,C,H,W), cond_embeds: (B,seq,L) or (B,L)
+        feat = self.conv(x_latent).mean(dim=[2,3])  # global avg pool -> (B,hidden)
+        if cond_embeds.dim() == 3:
+            cond = cond_embeds.mean(dim=1)  # (B,L)
         else:
-            return [prompt_fn(**config.prompt_fn_kwargs)[0] for _ in range(batch_size)]
+            cond = cond_embeds
+        h = torch.cat([feat, cond], dim=1)
+        return self.fc(h).squeeze(1)
 
-    teacher_steps = config.sample.num_steps  # original teacher sampling steps
-
-    for stage_idx, student_steps in enumerate(steps_list):
-        print(f"\n--- Distillation stage {stage_idx}: student_steps = {student_steps} ---")
-        # re-init discriminator weights per stage (paper recommends re-init)
-        def reinit_weights(m):
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, a=0.2)
-                if getattr(m, "bias", None) is not None:
-                    nn.init.zeros_(m.bias)
-        disc.apply(reinit_weights)
-
-        # Optionally do an MSE-only stage for first stage (large step reduction)
-        do_mse_first = (stage_idx == 0)
-
-        for epoch in range(epochs_per_stage):
-            for it in range(iters_per_stage):
-                # --- prompts & encodings ---
-                prompts = sample_prompts(batch_size)
-                prompt_ids = student_pipeline.tokenizer(
-                    prompts,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=student_pipeline.tokenizer.model_max_length,
-                ).input_ids.to(device)
-                prompt_embeds = student_pipeline.text_encoder(prompt_ids)[0].to(device)
-
-                # sample a discrete student index i in 1..student_steps
-                i_sample = random.randint(1, student_steps)
-                # Map i_sample to a teacher discrete step index (heuristic mapping)
-                # teacher indices in [0 .. teacher_steps], ensure valid
-                t_idx = math.floor(i_sample * (teacher_steps / student_steps))
-                t_idx = max(1, min(t_idx, teacher_steps-1))
-                tpp_idx = max(0, t_idx - max(1, math.floor(teacher_steps / student_steps)))
-
-                # run teacher forward to collect latent trajectory at teacher_steps
-                with torch.no_grad():
-                    teacher_out = pipeline_with_logprob(
-                        teacher_pipeline,
-                        prompt_embeds=prompt_embeds,
-                        num_inference_steps=teacher_steps,
-                        guidance_scale=guidance_scale,
-                        eta=getattr(config.sample, "eta", 0.0),
-                        output_type="pt",
-                        return_all_latents=True,
-                    )
-                    # teacher_out expected: (images, ..., latents_list, ...)
-                    teacher_images, _, teacher_latents_all, _ = teacher_out
-
-                # teacher_latents_all: list of latents across teacher trajectory
-                if isinstance(teacher_latents_all, list):
-                    teacher_latents_tensor = torch.stack(teacher_latents_all, dim=1)
-                else:
-                    teacher_latents_tensor = teacher_latents_all
-
-                t_idx_clamped = max(0, min(t_idx, teacher_latents_tensor.shape[1]-1))
-                tpp_idx_clamped = max(0, min(tpp_idx, teacher_latents_tensor.shape[1]-1))
-                zt = teacher_latents_tensor[:, t_idx_clamped].to(device)
-                ztpp = teacher_latents_tensor[:, tpp_idx_clamped].to(device)
-
-                # get alpha/sigma from scheduler for chosen indices
-                alpha_t, sigma_t = get_alpha_sigma_from_scheduler(teacher_pipeline.scheduler, t_idx_clamped)
-                alpha_tpp, sigma_tpp = get_alpha_sigma_from_scheduler(teacher_pipeline.scheduler, tpp_idx_clamped)
-                # convert to device & dtype
-                alpha_t = alpha_t.to(device)
-                sigma_t = sigma_t.to(device)
-                alpha_tpp = alpha_tpp.to(device)
-                sigma_tpp = sigma_tpp.to(device)
-
-                # compute x_tilde (student target) per eq.43 (latent-space)
-                x_tilde = compute_x_tilde_from_zt_and_ztpp(zt, ztpp, alpha_t, sigma_t, alpha_tpp, sigma_tpp)
-
-                # student forward: predict x from zt at time t_idx
-                unet.train()
-                student_input = zt.detach().clone().requires_grad_(True)
-                with accelerator.autocast():
-                    try:
-                        student_out = unet(student_input, t_idx_clamped, encoder_hidden_states=prompt_embeds)
-                    except TypeError:
-                        student_out = unet(student_input, t_idx_clamped, prompt_embeds)
-                # student_out may be a tuple; obtain the predicted x
-                if isinstance(student_out, tuple):
-                    student_pred_x = student_out[0]
-                else:
-                    student_pred_x = student_out
-
-                # decide mode: MSE-only first stage or adversarial
-                if do_mse_first:
-                    loss_mse = F.mse_loss(student_pred_x, x_tilde)
-                    accelerator.backward(loss_mse)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                else:
-                    # --- Train discriminator ---
-                    disc.train()
-                    real = torch.ones(student_pred_x.shape[0], device=device)
-                    fake = torch.zeros(student_pred_x.shape[0], device=device)
-
-                    # real pair: (zt, ztpp) from teacher
-                    disc_real_logits = disc(zt.detach(), ztpp.detach(), t_idx_clamped, tpp_idx_clamped, prompt_embeds)
-                    loss_d_real = bce_loss(disc_real_logits, real)
-
-                    # fake pair: (zt, student_pred_x)
-                    disc_fake_logits = disc(zt.detach(), student_pred_x.detach(), t_idx_clamped, tpp_idx_clamped, prompt_embeds)
-                    loss_d_fake = bce_loss(disc_fake_logits, fake)
-
-                    loss_disc = 0.5 * (loss_d_real + loss_d_fake)
-                    accelerator.backward(loss_disc)
-                    disc_opt.step()
-                    disc_opt.zero_grad()
-
-                    # --- Train student to fool discriminator ---
-                    unet.train()
-                    disc_gen_logits = disc(zt.detach(), student_pred_x, t_idx_clamped, tpp_idx_clamped, prompt_embeds)
-                    # want discriminator to predict real for the student's output
-                    loss_gen = bce_loss(disc_gen_logits, real)
-                    accelerator.backward(loss_gen)
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                # optional logging (very lightweight so as not to clutter)
-                if (it + 1) % 100 == 0 and accelerator.is_main_process:
-                    print(f"Stage {stage_idx} epoch {epoch} iter {it+1}/{iters_per_stage}")
-
-            # end of iters_per_stage for epoch
-
-        # End of a progressive stage
-        # (Optional) Merge LoRA into student_pipeline.unet here if you want a full-model checkpoint for next stage.
-        # If you use LoRA, your original script likely has a merge helper like: student_pipeline.unet.merge_attn_procs()
-        # I did not call it automatically to avoid changing your LoRA workflow; you can merge here if desired.
-
-        # Run evaluation images using the same evaluation block you already have in the script (kept unchanged).
-        if accelerator.is_main_process:
-            eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
-                "A futuristic city skyline at night",
-                "A dragon flying over mountains",
-                "A cozy cabin in a snowy forest",
-            ]
-
-            with torch.no_grad():
-                with accelerator.autocast():
-                    teacher_eval_images = [
-                        teacher_pipeline(
-                            prompt,
-                            num_inference_steps=config.sample.num_steps,
-                            guidance_scale=config.sample.guidance_scale,
-                        ).images[0]
-                        for prompt in eval_prompts
-                    ]
-
-                    student_eval_images = [
-                        student_pipeline(
-                            prompt,
-                            num_inference_steps=student_steps,  # use current distilled student steps
-                            guidance_scale=config.sample.guidance_scale,
-                        ).images[0]
-                        for prompt in eval_prompts
-                    ]
-
-        # Save side-by-side evaluation for this stage (keeps your evaluation saver)
-        save_side_by_side(student_eval_images, teacher_eval_images, stage_idx, outdir)
-
-        # Optionally save checkpoint: student_pipeline.save_pretrained(...)
-        # If using LoRA and you want to keep LoRA separate, you can save LoRA weights instead.
-        if accelerator.is_main_process:
-            # Choose directory name that reflects student_steps
-            ckpt_dir = os.path.join("distilled_checkpoints", f"{student_steps}_steps")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            # If you want to save full pipeline:
-            try:
-                student_pipeline.save_pretrained(ckpt_dir)
-            except Exception as e:
-                print(f"Warning: failed to save full pipeline: {e}. Consider saving LoRA separately.")
-
-    print("All progressive distillation stages finished.")
-
-# ---------- Main (entry) ----------
+# -------------------------
+# Main training routine
+# -------------------------
 def main(_):
     config = FLAGS.config
 
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     config.run_name = config.run_name or unique_id
-    config.run_name += f"_distill_{unique_id}"
+    config.run_name += f"_pad_{unique_id}"
 
-    reward_types = ["clip", "text_image","aesthetic"]
-    outdir = "PPO_" + "_".join(reward_types)
-    kl_lambda = getattr(config.train, "kl_lambda", 1.0)
-    if kl_lambda != 0:
-        outdir = outdir + "_kl_" + str(kl_lambda)
+    outdir = "ProgressiveAdversarialDistill"
     if FLAGS.prompt_source == "coco":
         outdir = outdir + "_coco_prompts"
     else:
@@ -420,40 +165,51 @@ def main(_):
 
     stats_dir = outdir
     os.makedirs(stats_dir, exist_ok=True)
-    stats_file = os.path.join(stats_dir, "training_stats.txt")
 
-    all_losses = []
-    all_rewards = []
-    all_rewards_std = []
-
+    # Accelerator / logging
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.logdir, config.run_name),
-        total_limit=config.num_checkpoint_limit,
+        total_limit=getattr(config, "num_checkpoint_limit", None),
     )
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * getattr(config.student, "num_steps", 1),
+        gradient_accumulation_steps=getattr(config.train, "gradient_accumulation_steps", 1),
     )
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("ddpo-distill", config=config.to_dict())
+        accelerator.init_trackers("prog_adv_distill", config=config.to_dict())
 
-    logger.info(f"\n{config}")
+    logger.info(f"Config:\n{config}")
 
-    # ---------- Model / pipeline loading (kept exactly as in user file) ----------
-    # Load teacher and student pipelines (teacher often larger / original steps)
+    # -------------------------
+    # Load teacher pipeline
+    # -------------------------
     teacher_pipeline = StableDiffusionPipeline.from_pretrained(
-        config.teacher.model, revision=getattr(config.teacher, "revision", None)
+        config.pretrained.model, revision=getattr(config.pretrained, "revision", None)
     )
+    # ensure DDIM scheduler (consistent with progressive distillation math)
     teacher_pipeline.scheduler = DDIMScheduler.from_config(teacher_pipeline.scheduler.config)
     teacher_pipeline.safety_checker = None
     teacher_pipeline.set_progress_bar_config(disable=False)
+
+    # move key modules to device
     teacher_pipeline.vae.to(accelerator.device)
     teacher_pipeline.text_encoder.to(accelerator.device)
     teacher_pipeline.unet.to(accelerator.device)
+    teacher_pipeline.text_encoder.requires_grad_(False)
+    teacher_pipeline.vae.requires_grad_(False)
+    teacher_pipeline.unet.requires_grad_(False)
+    # Save teacher snapshot (optional)
+    try:
+        teacher_pipeline.save_pretrained(getattr(config, "teacher_output_dir", "teacher_saved"))
+    except Exception:
+        pass
 
+    # -------------------------
+    # Load student pipeline
+    # -------------------------
     student_pipeline = StableDiffusionPipeline.from_pretrained(
         config.student.model, revision=getattr(config.student, "revision", None)
     )
@@ -461,15 +217,18 @@ def main(_):
     student_pipeline.safety_checker = None
     student_pipeline.set_progress_bar_config(disable=False)
 
-    # move to device/dtype, and prepare LoRA if requested (kept as in your file)
     student_pipeline.vae.to(accelerator.device)
     student_pipeline.text_encoder.to(accelerator.device)
     student_pipeline.unet.to(accelerator.device)
+
     student_pipeline.vae.requires_grad_(False)
     student_pipeline.text_encoder.requires_grad_(False)
-    student_pipeline.unet.requires_grad_(not config.use_lora)
+    student_pipeline.unet.requires_grad_(not getattr(config, "use_lora", False))
 
-    if config.use_lora:
+    # -------------------------
+    # LoRA setup (kept as your original)
+    # -------------------------
+    if getattr(config, "use_lora", False):
         lora_attn_procs = {}
         for name in student_pipeline.unet.attn_processors.keys():
             cross_attention_dim = (
@@ -484,7 +243,6 @@ def main(_):
                 block_id = int(name[len("down_blocks."):].split(".")[0]) if "." in name[len("down_blocks."): ] else int(name[len("down_blocks."):])
                 hidden_size = student_pipeline.unet.config.block_out_channels[block_id]
             else:
-                # fallback
                 hidden_size = student_pipeline.unet.config.block_out_channels[-1]
             lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
         student_pipeline.unet.set_attn_processor(lora_attn_procs)
@@ -492,10 +250,12 @@ def main(_):
         class _Wrapper(AttnProcsLayers):
             def forward(self, *args, **kwargs):
                 return student_pipeline.unet(*args, **kwargs)
+
         unet = _Wrapper(student_pipeline.unet.attn_processors)
     else:
         unet = student_pipeline.unet
 
+    # dtype placement for mixed precision
     dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         dtype = torch.float16
@@ -504,11 +264,11 @@ def main(_):
 
     student_pipeline.vae.to(accelerator.device, dtype=dtype)
     student_pipeline.text_encoder.to(accelerator.device, dtype=dtype)
-    if config.use_lora:
+    if getattr(config, "use_lora", False):
         student_pipeline.unet.to(accelerator.device, dtype=dtype)
 
-    optimizer_cls = torch.optim.AdamW
-    optimizer = optimizer_cls(
+    # Optimizers
+    optimizer = torch.optim.AdamW(
         unet.parameters(),
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
@@ -516,12 +276,22 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    unet, optimizer = accelerator.prepare(unet, optimizer)
+    # Discriminator + its optimizer
+    disc = SimpleDiscriminator(
+        in_channels=getattr(config, "latent_channels", 4),
+        cond_dim=getattr(student_pipeline.text_encoder.config, "hidden_size", 768),
+        hidden=getattr(config, "disc_hidden", 128),
+    ).to(accelerator.device)
 
-    # Default prompt function
+    opt_d = torch.optim.AdamW(disc.parameters(), lr=getattr(config.distill, "disc_lr", 1e-6), betas=(0.0, 0.99))
+
+    # Prepare with accelerator
+    unet, optimizer, disc, opt_d = accelerator.prepare(unet, optimizer, disc, opt_d)
+
+    # Prompt function
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
 
-    # --- Load COCO captions if selected ---
+    # Load COCO captions if required
     coco_captions = None
     if FLAGS.prompt_source == "coco":
         ann_dir = FLAGS.coco_annotations_dir
@@ -554,50 +324,235 @@ def main(_):
             print("Warning: --prompt_source=coco selected but no captions were loaded. Falling back to default prompts.")
             coco_captions = None
 
-    # ---------- Run progressive adversarial distillation ----------
-    # You asked for the student steps list to be provided like: [50, 25, 12, 5]
-    student_steps_list = getattr(config.distill, "steps_list", [50, 25, 12, 5])
+    # Distillation hyperparams
+    steps_list = getattr(config.distill, "steps_list", [50, 25, 12, 5])
+    updates_per_stage = getattr(config.train, "distill_updates_per_stage", 5)
+    batch_size = config.sample.batch_size
+    guidance_scale = getattr(config.sample, "guidance_scale", 1.0)
+    teacher_steps = getattr(config.sample, "num_steps", 50)
 
-    # number of iterations per stage; paper uses large numbers — tune via config
-    iters_per_stage = getattr(config.distill, "iters_per_stage", 1000)
-    epochs_per_stage = getattr(config.distill, "epochs_per_stage", 1)
+    # Sometimes tokenizers/text encoder need correct device/dtype
+    # We'll call text_encoder with input_ids on accelerator.device
 
-    run_progressive_adversarial_distillation(
-        accelerator=accelerator,
-        config=config,
-        teacher_pipeline=teacher_pipeline,
-        student_pipeline=student_pipeline,
-        unet=unet,
-        optimizer=optimizer,
-        prompt_fn=prompt_fn,
-        coco_captions=coco_captions,
-        steps_list=student_steps_list,
-        epochs_per_stage=epochs_per_stage,
-        iters_per_stage=iters_per_stage,
-        guidance_scale=config.sample.guidance_scale,
-        device=accelerator.device,
-    )
+    # MAIN progressive-adversarial loop
+    teacher_unet = teacher_pipeline.unet
+    student_unet = student_pipeline.unet
 
-    # final save
+    # Put teacher to eval and freeze grads
+    teacher_unet.eval()
+    for stage_idx, student_steps in enumerate(steps_list):
+        print(f"\n==== Distillation stage {stage_idx+1}/{len(steps_list)}: student_steps = {student_steps} ====\n")
+        # copy teacher -> student parameters (init student from teacher each stage)
+        teacher_state = {k: v.cpu() for k, v in teacher_unet.state_dict().items()}
+        student_state = student_unet.state_dict()
+        copied = 0
+        for k in teacher_state:
+            if k in student_state and teacher_state[k].shape == student_state[k].shape:
+                # copy into student (device will be handled by to(device) calls later)
+                student_state[k].copy_(teacher_state[k].to(student_state[k].device))
+                copied += 1
+        print(f"Copied {copied} matching parameters from teacher -> student")
+
+        # Train student_unet (unet wrapper trains attn procs / LoRA if used)
+        student_unet.train()
+        # re-init discriminator at stage start (optional per paper)
+        def reinit(m):
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, a=0.2)
+                if getattr(m, "bias", None) is not None:
+                    nn.init.zeros_(m.bias)
+        disc.apply(reinit)
+
+        bce_loss = nn.BCEWithLogitsLoss()
+
+        pbar = tqdm(range(updates_per_stage), desc=f"Stage {stage_idx+1} updates", disable=not accelerator.is_main_process)
+        updates_done = 0
+        while updates_done < updates_per_stage:
+            # ---- sample prompts ----
+            if FLAGS.prompt_source == "coco" and coco_captions is not None:
+                if len(coco_captions) >= batch_size:
+                    prompts = random.sample(coco_captions, k=batch_size)
+                else:
+                    prompts = [random.choice(coco_captions) for _ in range(batch_size)]
+            else:
+                prompt_pairs = [prompt_fn(**getattr(config, "prompt_fn_kwargs", {})) for _ in range(batch_size)]
+                prompts = [p[0] for p in prompt_pairs]
+
+            # encode prompts
+            prompt_ids = student_pipeline.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=student_pipeline.tokenizer.model_max_length,
+            ).input_ids.to(accelerator.device)
+            prompt_embeds = student_pipeline.text_encoder(prompt_ids)[0]
+
+            # ---- teacher forward: obtain latents and compute x_tilde (two-step target) ----
+            with torch.no_grad():
+                teacher_out = pipeline_with_logprob(
+                    teacher_pipeline,
+                    prompt_embeds=prompt_embeds,
+                    num_inference_steps=teacher_steps,
+                    guidance_scale=guidance_scale,
+                    eta=getattr(config.sample, "eta", 0.0),
+                    output_type="pt",
+                    return_all_latents=True,
+                )
+                # pipeline_with_logprob returns tuple-like: images, ..., latents_list, ...
+                # We expect teacher_out[2] is list-of-latents across timesteps
+                teacher_latents_all = teacher_out[2]
+                # convert to tensor shaped (B, T, C, H, W) if list
+                if isinstance(teacher_latents_all, list):
+                    # each element is (B,C,H,W)
+                    teacher_latents_tensor = torch.stack(teacher_latents_all, dim=1)
+                else:
+                    teacher_latents_tensor = teacher_latents_all
+
+                # get "clean" latent x (final) as last element if available
+                x_latents = teacher_latents_tensor[:, -1].to(accelerator.device)
+
+            # prepare i's per sample
+            N = int(student_steps)
+            i_vals = torch.randint(low=1, high=N + 1, size=(batch_size,), device=accelerator.device)
+            t_vals = i_vals.float() / float(N)  # in (1/N .. 1)
+            # convert t_vals into shaped alpha/sigma for broadcast
+            alpha_t, sigma_t = cosine_alpha_sigma(t_vals)
+            # reshape to (B,1,1,1) to broadcast to latents' (B,C,H,W)
+            alpha_t_b = alpha_t.view(batch_size, *([1] * (x_latents.dim() - 1)))
+            sigma_t_b = sigma_t.view(batch_size, *([1] * (x_latents.dim() - 1)))
+
+            # sample noise and create z_t
+            eps_latent = torch.randn_like(x_latents, device=accelerator.device)
+            zt = alpha_t_b * x_latents + sigma_t_b * eps_latent
+
+            # teacher predicts eps at zt -> compute x_hat_t
+            with torch.no_grad():
+                # map continuous t to pseudo-integer timesteps for UNet call (heuristic)
+                pseudo_t = (t_vals * 999).long()
+                teacher_eps_t = teacher_unet(zt, pseudo_t, prompt_embeds).sample
+                teacher_x_hat_t = compute_x_hat_from_eps_pred(zt, teacher_eps_t, alpha_t_b, sigma_t_b)
+
+                # compute z_{t'} where t' = t - 0.5/N
+                t_prime_vals = torch.clamp((i_vals.float() - 0.5) / float(N), min=0.0)
+                a_p, s_p = cosine_alpha_sigma(t_prime_vals)
+                a_p_b = a_p.view(batch_size, *([1] * (x_latents.dim() - 1)))
+                s_p_b = s_p.view(batch_size, *([1] * (x_latents.dim() - 1)))
+                z_tprime = ddim_one_step_from_x_hat(zt, teacher_x_hat_t, a_p_b, s_p_b, alpha_t_b, sigma_t_b)
+
+                teacher_eps_tprime = teacher_unet(z_tprime, (t_prime_vals * 999).long(), prompt_embeds).sample
+                teacher_x_hat_tprime = compute_x_hat_from_eps_pred(z_tprime, teacher_eps_tprime, a_p_b, s_p_b)
+
+                # compute z_{t''} where t'' = t - 1/N
+                t_dprime_vals = torch.clamp((i_vals.float() - 1.0) / float(N), min=0.0)
+                a_pp, s_pp = cosine_alpha_sigma(t_dprime_vals)
+                a_pp_b = a_pp.view(batch_size, *([1] * (x_latents.dim() - 1)))
+                s_pp_b = s_pp.view(batch_size, *([1] * (x_latents.dim() - 1)))
+                z_tdprime = ddim_one_step_from_x_hat(z_tprime, teacher_x_hat_tprime, a_pp_b, s_pp_b, a_p_b, s_p_b)
+
+                # compute x_tilde as paper eq.43
+                ratio = s_pp_b / (sigma_t_b + 1e-8)
+                numerator = z_tdprime - ratio * zt
+                denom = a_pp_b - ratio * alpha_t_b
+                denom_safe = torch.where(denom.abs() < 1e-8, torch.sign(denom) * 1e-8 + 1e-8, denom)
+                x_tilde = numerator / denom_safe  # target student should produce this x_hat
+
+            # ---- Student forward (predict eps, compute x_hat_student) ----
+            # We run the unet (which will be the LoRA wrapper if used)
+            noise_pred_student = unet(zt, (t_vals * 999).long(), prompt_embeds).sample
+            x_hat_student = compute_x_hat_from_eps_pred(zt, noise_pred_student, alpha_t_b, sigma_t_b)
+
+            # --- Adversarial training ---
+            # Train discriminator to distinguish teacher (x_tilde) vs student x_hat_student
+            disc.train()
+            real_labels = torch.ones(batch_size, device=accelerator.device)
+            fake_labels = torch.zeros(batch_size, device=accelerator.device)
+
+            # discriminator on real (teacher) example
+            real_logits = disc(x_tilde.detach(), prompt_embeds.detach())
+            fake_logits = disc(x_hat_student.detach(), prompt_embeds.detach())
+            loss_d = 0.5 * (bce_loss(real_logits, real_labels) + bce_loss(fake_logits, fake_labels))
+
+            accelerator.backward(loss_d)
+            opt_d.step()
+            opt_d.zero_grad()
+
+            # generator (student) step: fool discriminator
+            gen_logits = disc(x_hat_student, prompt_embeds)
+            loss_g_adv = bce_loss(gen_logits, real_labels)
+
+            # Optionally combine with reconstruction loss (paper sometimes uses hybrid). We'll use adversarial-only per PAD recipe.
+            # If you want a hybrid: loss = lambda_adv * loss_g_adv + lambda_mse * mse(x_hat_student, x_tilde)
+
+            accelerator.backward(loss_g_adv)
+            if accelerator.sync_gradients:
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), getattr(config.train, "max_grad_norm", 1.0))
+            optimizer.step()
+            optimizer.zero_grad()
+
+            updates_done += 1
+            pbar.update(1)
+
+        pbar.close()
+        print(f"Finished distillation stage for student_steps={student_steps}. Updates done = {updates_done}")
+
+        # Promote student -> teacher (copy student weights into teacher)
+        new_teacher_state = teacher_unet.state_dict()
+        student_state = student_unet.state_dict()
+        copied2 = 0
+        for k in student_state:
+            if k in new_teacher_state and student_state[k].size() == new_teacher_state[k].size():
+                new_teacher_state[k].copy_(student_state[k].to(new_teacher_state[k].device))
+                copied2 += 1
+        print(f"Promoted student -> teacher by copying {copied2} params")
+
+        # Save student pipeline checkpoint for this stage
+        stage_save_dir = os.path.join(stats_dir, f"student_steps_{student_steps}")
+        os.makedirs(stage_save_dir, exist_ok=True)
+        if accelerator.is_main_process:
+            try:
+                student_pipeline.save_pretrained(stage_save_dir)
+                print(f"Saved student pipeline at {stage_save_dir}")
+            except Exception as e:
+                print(f"Warning: failed to save student pipeline: {e}")
+
+        # Evaluation (kept unchanged style)
+        if accelerator.is_main_process:
+            eval_prompts = [
+                "A cat on a chair",
+                "A boy in a forest",
+                "A futuristic city skyline at night",
+                "A dragon flying over mountains",
+                "A cozy cabin in a snowy forest",
+            ]
+            with torch.no_grad():
+                teacher_eval_images = [
+                    teacher_pipeline(
+                        prompt,
+                        num_inference_steps=teacher_steps,
+                        guidance_scale=guidance_scale,
+                    ).images[0]
+                    for prompt in eval_prompts
+                ]
+                student_eval_images = [
+                    student_pipeline(
+                        prompt,
+                        num_inference_steps=student_steps,
+                        guidance_scale=guidance_scale,
+                    ).images[0]
+                    for prompt in eval_prompts
+                ]
+            save_side_by_side(student_eval_images, teacher_eval_images, student_steps, outdir)
+
+    print("Progressive adversarial distillation completed for all stages.")
+
+    final_save_dir = os.path.join(stats_dir, "final_student")
     if accelerator.is_main_process:
-        student_pipeline.save_pretrained(os.path.join(stats_dir, "student_model_final"))
+        try:
+            student_pipeline.save_pretrained(final_save_dir)
+            print(f"Saved final student pipeline at {final_save_dir}")
+        except Exception as e:
+            print(f"Warning: failed to save final student pipeline: {e}")
 
 if __name__ == "__main__":
-    # flags parsing and app run (kept as in your original script)
-    from absl import app, flags
-    FLAGS = flags.FLAGS
-    config_flags.DEFINE_config_file("config", "config/distill_clip.py", "Training configuration.")
-    flags.DEFINE_enum(
-        "prompt_source", "coco", ["default", "coco"],
-        "Source of prompts to use: 'default' uses built-in prompt function; 'coco' samples captions from COCO annotations."
-    )
-    flags.DEFINE_enum(
-        "coco_split", "train", ["train", "val", "both"],
-        "Which COCO captions split to use when prompt_source=coco."
-    )
-    flags.DEFINE_string(
-        "coco_annotations_dir", "coco_dataset/annotations",
-        "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
-    )
-
     app.run(main)

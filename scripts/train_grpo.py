@@ -69,7 +69,7 @@ def main(_):
     config.train.kl_beta = getattr(config.train, "kl_beta", 0.04) # Beta for KL penalty
 
 
-    reward_types = ["clip", "text_image"]
+    reward_types = ["clip", "dino", "text_image"]
     
 
     outdir = "GRPO_" + "_".join(reward_types)
@@ -237,7 +237,7 @@ def main(_):
         rewards_grouped = rewards.view(batch_size, group_size)
         rewards_mean = rewards_grouped.mean(dim=1, keepdim=True)
         rewards_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8 # Add epsilon for numerical stability
-        advantages_grouped = (rewards_grouped - rewards_mean) / rewards_std
+        advantages_grouped = (rewards_grouped - rewards_mean)
         advantages_flat = advantages_grouped.view(-1) # Flatten back to per-sample shape
 
         latents = torch.stack(student_latents_all, dim=1)
