@@ -1,14 +1,6 @@
 # File: config/distill_clip.py
 import ml_collections
 
-# from huggingface_hub import snapshot_download
-
-# snapshot_download(
-#     "stabilityai/stable-diffusion-xl-base-1.0",
-#     resume_download=True,
-#     max_workers=1,   # fewer parallel threads → less chance of timeout
-# )
-
 def get_config():
     config = ml_collections.ConfigDict()
 
@@ -52,12 +44,12 @@ def get_config():
     sample.num_steps = 50
     sample.eta = 1.0
     sample.guidance_scale = 5.0
-    sample.batch_size = 1
+    sample.batch_size = 8
     # sample.num_batches_per_epoch = 2
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 1
+    train.batch_size = 8
     train.use_8bit_adam = False
     train.learning_rate = 3e-4
     train.adam_beta1 = 0.9
@@ -125,5 +117,16 @@ def get_config():
     config.distill.updates_per_stage = 5
 
     # =================================
+
+
+
+
+
+    config.gan = ml_collections.ConfigDict()
+    config.gan.enabled = True
+    config.gan.weight = 0.5        # or 1.0
+    config.gan.type = "patchgan"   # or "stylegan", depending on your code
+    config.gan.lr = 1e-4
+    config.gan.n_layers = 3
 
     return config
