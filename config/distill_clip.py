@@ -44,12 +44,12 @@ def get_config():
     sample.num_steps = 50
     sample.eta = 1.0
     sample.guidance_scale = 5.0
-    sample.batch_size = 8
+    sample.batch_size = 2
     # sample.num_batches_per_epoch = 2
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 8
+    train.batch_size = 2
     train.use_8bit_adam = False
     train.learning_rate = 3e-4
     train.adam_beta1 = 0.9
