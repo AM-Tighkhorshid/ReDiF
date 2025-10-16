@@ -335,7 +335,7 @@ def main(_):
     # Dry-forward a tiny tensor to determine mid feature channels if possible
     disc = None
     disc_optimizer = None
-    if getattr(config.gan, "use_gan", False):
+    if getattr(config.gan, "use_gan", True):
         try:
             dummy_bs = 1
             height = getattr(config.sample, "height", 512)
