@@ -49,6 +49,33 @@ def save_side_by_side(student_images, teacher_images, epoch, outdir):
         combined.save(outpath)
         print(f"Saved {outpath}")
 
+
+def js_divergence(p, q):
+    p = F.softmax(p, dim=-1)
+    q = F.softmax(q, dim=-1)
+    m = 0.5 * (p + q)
+    js = 0.5 * (F.kl_div(p.log(), m, reduction="batchmean", log_target=False) +
+                F.kl_div(q.log(), m, reduction="batchmean", log_target=False))
+    return js
+
+def chi2_divergence(p, q):
+    p = F.softmax(p, dim=-1)
+    q = F.softmax(q, dim=-1)
+    div = torch.mean(torch.sum(((p - q) ** 2) / (q + 1e-8), dim=-1))
+    return div
+
+def power_divergence(p, q, power=1.2):
+    p = F.softmax(p, dim=-1)
+    q = F.softmax(q, dim=-1)
+    div = torch.mean(torch.sum((p ** power * q ** (1 - power) - 1) / (power * (power - 1)), dim=-1))
+    return div
+
+def renyi_divergence(p, q, alpha=0.6):
+    p = F.softmax(p, dim=-1)
+    q = F.softmax(q, dim=-1)
+    div = (1.0 / (alpha - 1.0)) * torch.log(torch.sum(p ** alpha * q ** (1 - alpha), dim=-1) + 1e-8)
+    return torch.mean(div)
+
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
 FLAGS = flags.FLAGS
@@ -66,6 +93,18 @@ flags.DEFINE_enum(
 flags.DEFINE_string(
     "coco_annotations_dir", "coco_dataset/annotations",
     "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
+)
+flags.DEFINE_enum(
+    "divergence_type",
+    default="renyi",
+    enum_values=["kl", "js", "chi2", "power", "renyi"],
+    help="Divergence function to use for PPO regularization."
+)
+
+flags.DEFINE_float(
+    "divergence_param",
+    default=0.2,
+    help="Extra parameter (p or α) for power or Rényi divergences."
 )
 
 logger = get_logger(__name__)
@@ -92,11 +131,12 @@ def main(_):
     config.run_name = config.run_name or unique_id
     config.run_name += f"_distill_{unique_id}"
 
-    reward_types = ["clip", "text_image","aesthetic"]
+    div_type = FLAGS.divergence_type.lower()
+    reward_types = ["clip"]
     outdir = "PPO_" + "_".join(reward_types)
     kl_lambda = getattr(config.train, "kl_lambda", 1.0)
     if kl_lambda != 0:
-        outdir = outdir + "_kl_" + str(kl_lambda)
+        outdir = outdir + "_" + div_type + "_" + str(kl_lambda)
     if FLAGS.prompt_source == "coco":
         outdir = outdir + "_coco_prompts"
     else:
@@ -310,12 +350,27 @@ def main(_):
                 align_corners=True,
             ).squeeze(1)
 
-        kl_loss_total = torch.nn.functional.kl_div(
-            aligned_student_log_probs,
-            aligned_teacher_log_probs,
-            reduction="batchmean",
-            log_target=True
-        )
+
+        div_type = FLAGS.divergence_type.lower()
+        if div_type == "kl":
+            kl_loss_total = kl_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
+        elif div_type == "js":
+            kl_loss_total = js_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
+        elif div_type == "chi2":
+            kl_loss_total = chi2_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
+        elif div_type == "power":
+            kl_loss_total = power_divergence(aligned_student_log_probs, aligned_teacher_log_probs, FLAGS.divergence_param)
+        elif div_type == "renyi":
+            kl_loss_total = renyi_divergence(aligned_student_log_probs, aligned_teacher_log_probs, FLAGS.divergence_param)
+        else:
+            raise ValueError(f"Unknown divergence type: {div_type}")
+
+        # kl_loss_total = torch.nn.functional.kl_div(
+        #     aligned_student_log_probs,
+        #     aligned_teacher_log_probs,
+        #     reduction="batchmean",
+        #     log_target=True
+        # )
 
         student_pipeline.unet.train()
         for j in range(config.student.num_steps):
@@ -332,7 +387,7 @@ def main(_):
                     )
                 adv = torch.clamp(advantages, -config.train.adv_clip_max, config.train.adv_clip_max)
                 print(advantages)
-                ratio = torch.exp(log_prob - aligned_student_log_probs[:,j])
+                ratio = torch.exp(log_prob - log_probs)
                 unclipped = -adv * ratio
                 print(ratio)
                 clipped = -adv * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
