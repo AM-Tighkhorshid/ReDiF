@@ -1,6 +1,6 @@
-# scripts/evaluate.py
 import os
 import json
+import csv
 import torch
 from diffusers import StableDiffusionPipeline
 from tqdm import tqdm
@@ -12,66 +12,108 @@ import torch.nn.functional as F
 import numpy as np
 import argparse
 
+
 # --------------------
 # Args
+# --------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--split", choices=["val", "test"], default="val", help="COCO split to evaluate on")
+parser.add_argument("--dataset", choices=["coco", "laion"], default="coco", help="Dataset type to evaluate on")
+parser.add_argument("--split", choices=["val", "test"], default="val", help="Dataset split to evaluate on")
 parser.add_argument("--coco_root", default="coco_dataset", help="Root folder of COCO dataset")
+parser.add_argument("--laion_root", default="laion_dataset", help="Root folder of LAION dataset")
 parser.add_argument("--num_images", type=int, default=100, help="Number of images to evaluate")
-parser.add_argument("--teacher_model", default="output/distill_clip/teacher_model", help="Teacher model dir")
-parser.add_argument("--student_model", default="PPO_clip_dino_text_image_aesthetic_kl_1.0_coco_prompts/student_model", help="Student model dir")
-parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher sampling steps")
-parser.add_argument("--student_steps", type=int, default=5, help="Student sampling steps")
+parser.add_argument("--teacher_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/checkpoints/epoch_5", help="Teacher model directory")
+parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/output/distill_clip/teacher_model", help="Student model directory")
+parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
+parser.add_argument("--student_steps", type=int, default=50, help="Student diffusion steps")
+
 args = parser.parse_args()
 
-COCO_ROOT = args.coco_root
-SPLIT = args.split
-NUM_IMAGES = args.num_images
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 TEACHER_MODEL = args.teacher_model
 STUDENT_MODEL = args.student_model
 TEACHER_DIR = os.path.join(TEACHER_MODEL, "evaluation_images_teacher")
-STUDENT_DIR = os.path.join(STUDENT_MODEL, "evaluation_images_student")
-TEACHER_STEPS = args.teacher_steps
-STUDENT_STEPS = args.student_steps
-
-ANN_FILE = os.path.join(COCO_ROOT, "annotations", f"captions_{SPLIT}2017.json")
-IMG_DIR = os.path.join(COCO_ROOT, f"{SPLIT}2017")
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+STUDENT_DIR = os.path.join(STUDENT_MODEL, "evaluation_images_teacher")
 os.makedirs(TEACHER_DIR, exist_ok=True)
 os.makedirs(STUDENT_DIR, exist_ok=True)
 
 # --------------------
-# Load COCO captions & gt image paths (unique images)
-with open(ANN_FILE, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-id_to_file = {img["id"]: img["file_name"] for img in data["images"]}
-annotations = data["annotations"]
-
-seen = set()
+# Dataset Loading
+# --------------------
 prompts, gt_images = [], []
-for ann in annotations:
-    img_id = ann["image_id"]
-    if img_id in seen:
-        continue
-    seen.add(img_id)
-    caption = ann["caption"]
-    file_name = id_to_file[img_id]
-    img_path = os.path.join(IMG_DIR, file_name)
-    if os.path.exists(img_path):
-        prompts.append(caption)
+
+def load_coco_data(root, split, num_images):
+    ann_file = os.path.join(root, "annotations", f"captions_{split}2017.json")
+    img_dir = os.path.join(root, f"{split}2017")
+
+    with open(ann_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    id_to_file = {img["id"]: img["file_name"] for img in data["images"]}
+    seen = set()
+    prompts, gt_images = [], []
+    for ann in data["annotations"]:
+        img_id = ann["image_id"]
+        if img_id in seen:
+            continue
+        seen.add(img_id)
+        caption = ann["caption"]
+        file_name = id_to_file[img_id]
+        img_path = os.path.join(img_dir, file_name)
+        if os.path.exists(img_path):
+            prompts.append(caption)
+            gt_images.append(img_path)
+        if len(prompts) >= num_images:
+            break
+
+    print("-" * 50)
+    print(f"List of {len(prompts)} Prompts Used for Image Generation:")
+    print("-" * 50)
+
+    for i, prompt in enumerate(prompts):
+        # Prints the index (0-99) followed by the prompt
+        print(f"Prompt {i+1} ({i:04}.png): {prompt}") 
+
+    print("-" * 50)
+    return prompts, gt_images
+
+def load_laion_data(root, split, num_images):
+    ann_file = os.path.join(root, f"captions_{split}.json")
+    img_dir = os.path.join(root,"images", f"{split}")
+    if not os.path.exists(ann_file):
+        raise FileNotFoundError(f"Missing LAION annotation file: {ann_file}")
+    with open(ann_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    prompts, gt_images = [], []
+    for entry in data:
+        caption = entry.get("caption")
+        file_name = entry.get("file_name")
+        img_path = os.path.join(img_dir, file_name)
+        if not os.path.exists(img_path):
+            continue
+        if not caption or len(caption.strip()) < 3:
+            continue
+        prompts.append(caption.strip())
         gt_images.append(img_path)
-    if len(prompts) >= NUM_IMAGES:
-        break
+        if len(prompts) >= num_images:
+            break
+    return prompts, gt_images
 
-if len(prompts) < NUM_IMAGES:
-    raise RuntimeError(f"Only found {len(prompts)} valid GT images; need {NUM_IMAGES}")
 
-print(f"Loaded {len(prompts)} prompts and GT images from COCO {SPLIT}2017")
+if args.dataset == "coco":
+    prompts, gt_images = load_coco_data(args.coco_root, args.split, args.num_images)
+    print(f"Loaded {len(prompts)} samples from COCO {args.split}2017")
+elif args.dataset == "laion":
+    prompts, gt_images = load_laion_data(args.laion_root, args.split, args.num_images)
+    print(f"Loaded {len(prompts)} samples from LAION {args.split}2017")
+
+if len(prompts) < args.num_images:
+    raise RuntimeError(f"Found only {len(prompts)} valid images; need {args.num_images}")
 
 # --------------------
-# Generation helper
+# Generation
+# --------------------
 def generate_images(model_dir, prompts, out_dir, num_steps):
     existing_pngs = sorted([f for f in os.listdir(out_dir) if f.endswith(".png")])
     if len(existing_pngs) >= len(prompts):
@@ -79,9 +121,7 @@ def generate_images(model_dir, prompts, out_dir, num_steps):
         return
 
     pipe = StableDiffusionPipeline.from_pretrained(
-        model_dir,
-        torch_dtype=torch.float16,
-        safety_checker=None,
+        model_dir, torch_dtype=torch.float16, safety_checker=None
     ).to(DEVICE)
     pipe.set_progress_bar_config(disable=True)
 
@@ -92,14 +132,14 @@ def generate_images(model_dir, prompts, out_dir, num_steps):
     del pipe
     torch.cuda.empty_cache()
 
-# Generate (or skip if exist)
-generate_images(TEACHER_MODEL, prompts, TEACHER_DIR, TEACHER_STEPS)
-generate_images(STUDENT_MODEL, prompts, STUDENT_DIR, STUDENT_STEPS)
+generate_images(TEACHER_MODEL, prompts, TEACHER_DIR, args.teacher_steps)
+generate_images(STUDENT_MODEL, prompts, STUDENT_DIR, args.student_steps)
 
 # --------------------
-# Utilities for metrics
+# Metrics
+# --------------------
 resize_299 = T.Resize((299, 299))
-to_tensor = T.ToTensor()  # float [0,1]
+to_tensor = T.ToTensor()
 
 def load_images_as_uint8(folder, limit=None):
     files = sorted([f for f in os.listdir(folder) if f.endswith(".png")])
@@ -109,9 +149,8 @@ def load_images_as_uint8(folder, limit=None):
     for fn in files:
         im = Image.open(os.path.join(folder, fn)).convert("RGB")
         im = resize_299(im)
-        t = to_tensor(im) * 255.0   # float [0,255]
-        t = t.to(torch.uint8)       # cast to uint8
-        imgs.append(t)
+        t = to_tensor(im) * 255.0
+        imgs.append(t.to(torch.uint8))
     return torch.stack(imgs).to(DEVICE)
 
 def load_gt_images_as_uint8(paths):
@@ -120,42 +159,60 @@ def load_gt_images_as_uint8(paths):
         im = Image.open(p).convert("RGB")
         im = resize_299(im)
         t = to_tensor(im) * 255.0
-        t = t.to(torch.uint8)
-        imgs.append(t)
+        imgs.append(t.to(torch.uint8))
     return torch.stack(imgs).to(DEVICE)
 
-# --------------------
-# CLIP model
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 @torch.no_grad()
 def compute_clip_pairwise_scores_from_files(images_folder, prompts):
-    text_inputs = clip_processor(text=prompts, return_tensors="pt", padding=True).to(DEVICE)
+    from transformers import CLIPModel, CLIPProcessor
+    import torch.nn.functional as F
+
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
+    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    tokenizer = clip_processor.tokenizer
+
+    # ----- Strict truncation to CLIP limit (77 tokens) -----
+    encodings = tokenizer(
+        prompts,
+        padding="max_length",
+        truncation=True,
+        max_length=77,
+        return_tensors="pt"
+    )
+
+    # Hard truncate if still exceeds max_length
+    for key in encodings:
+        encodings[key] = encodings[key][:, :77]
+    text_inputs = {k: v.to(DEVICE) for k, v in encodings.items()}
+    # --------------------------------------------------------
+
+    # Get normalized text features
     text_feats = clip_model.get_text_features(**text_inputs)
     text_feats = F.normalize(text_feats, dim=-1).cpu().numpy()
 
+    # Get normalized image features
     image_feats = []
     files = sorted([f for f in os.listdir(images_folder) if f.endswith(".png")])[: len(prompts)]
     for fn in files:
-        im = Image.open(os.path.join(images_folder, fn)).convert("RGB")
-        im = clip_processor(images=im, return_tensors="pt").to(DEVICE)
-        f = clip_model.get_image_features(**im)
+        im = Image.open(os.path.join(images_folder, fn))
+        im_inputs = clip_processor(images=im, return_tensors="pt").to(DEVICE)
+        f = clip_model.get_image_features(**im_inputs)
         f = F.normalize(f, dim=-1).cpu().numpy()
         image_feats.append(f)
-    image_feats = np.concatenate(image_feats, axis=0)
 
+    image_feats = np.concatenate(image_feats, axis=0)
     sims = (image_feats * text_feats).sum(axis=1)
     sims01 = (sims + 1.0) / 2.0
     return float(sims01.mean())
 
-# --------------------
-# PRDC implementation (pure numpy)
+
 def pairwise_distances_np(a, b):
     a2 = np.sum(a * a, axis=1).reshape(-1, 1)
     b2 = np.sum(b * b, axis=1).reshape(1, -1)
-    d2 = a2 + b2 - 2.0 * np.dot(a, b.T)
-    d2 = np.maximum(d2, 0.0)
+    d2 = np.maximum(a2 + b2 - 2.0 * np.dot(a, b.T), 0.0)
     return np.sqrt(d2)
 
 def compute_prdc(real_features, fake_features, nearest_k=5):
@@ -163,28 +220,18 @@ def compute_prdc(real_features, fake_features, nearest_k=5):
     d_ff = pairwise_distances_np(fake_features, fake_features)
     rk = np.sort(d_rr, axis=1)[:, nearest_k]
     fk = np.sort(d_ff, axis=1)[:, nearest_k]
-
     d_fr = pairwise_distances_np(fake_features, real_features)
     d_rf = pairwise_distances_np(real_features, fake_features)
-
     nearest_real_idx = np.argmin(d_fr, axis=1)
     nearest_real_dist = d_fr.min(axis=1)
     precision = (nearest_real_dist <= rk[nearest_real_idx]).mean()
-
     nearest_fake_idx = np.argmin(d_rf, axis=1)
     nearest_fake_dist = d_rf.min(axis=1)
     recall = (nearest_fake_dist <= fk[nearest_fake_idx]).mean()
+    density = ((d_fr.T <= rk.reshape(-1, 1)).sum(axis=1) / float(nearest_k)).mean()
+    coverage = ((d_fr.T <= rk.reshape(-1, 1)).sum(axis=1) > 0).mean()
+    return dict(precision=float(precision), recall=float(recall), density=float(density), coverage=float(coverage))
 
-    d_fr_T = d_fr.T
-    counts_in_radius = (d_fr_T <= rk.reshape(-1, 1)).sum(axis=1)
-    density = (counts_in_radius / float(nearest_k)).mean()
-    coverage = (counts_in_radius > 0).mean()
-
-    return {"precision": float(precision), "recall": float(recall),
-            "density": float(density), "coverage": float(coverage)}
-
-# --------------------
-# Evaluate helper
 def compute_fid_between(gt_paths, gen_folder):
     fid = FrechetInceptionDistance().to(DEVICE)
     real_t = load_gt_images_as_uint8(gt_paths)
@@ -200,7 +247,8 @@ def compute_prdc_and_clip_and_save(model_name, gen_folder, prompts, gt_paths, sa
 
     real_feats, fake_feats = [], []
     for p in gt_paths:
-        inputs = clip_processor(images=Image.open(p).convert("RGB"), return_tensors="pt").to(DEVICE)
+        im = Image.open(p)
+        inputs = clip_processor(images=im, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
             f = clip_model.get_image_features(**inputs)
             f = F.normalize(f, dim=-1).cpu().numpy()
@@ -216,7 +264,7 @@ def compute_prdc_and_clip_and_save(model_name, gen_folder, prompts, gt_paths, sa
             fake_feats.append(f)
     fake_feats = np.concatenate(fake_feats, axis=0)
 
-    prdc_metrics = compute_prdc(real_feats, fake_feats, nearest_k=5)
+    prdc_metrics = compute_prdc(real_feats, fake_feats)
     results.update(prdc_metrics)
 
     print(f"\nResults for {model_name}:")
@@ -224,12 +272,11 @@ def compute_prdc_and_clip_and_save(model_name, gen_folder, prompts, gt_paths, sa
         print(f"  {k}: {v:.6f}")
 
     with open(save_metrics_path, "w") as f:
-        f.write(f"Evaluation results for {model_name} on COCO {SPLIT}2017\n")
+        f.write(f"Evaluation results for {model_name} on {args.dataset.upper()} dataset\n")
         for k, v in results.items():
             f.write(f"{k}: {v}\n")
+
     return results
 
-# --------------------
-# Run evaluations
 compute_prdc_and_clip_and_save("Teacher", TEACHER_DIR, prompts, gt_images, os.path.join(TEACHER_MODEL, "metrics.txt"))
 compute_prdc_and_clip_and_save("Student", STUDENT_DIR, prompts, gt_images, os.path.join(STUDENT_MODEL, "metrics.txt"))
