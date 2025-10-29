@@ -6,7 +6,7 @@ def get_config():
 
     ###### General ######
     config.run_name = ""
-    config.seed = 42
+    config.seed = 44
     config.logdir = "logs"
     config.num_epochs = 20
     config.save_freq = 20
@@ -44,19 +44,19 @@ def get_config():
     sample.num_steps = 50
     sample.eta = 1.0
     sample.guidance_scale = 5.0
-    sample.batch_size = 2
+    sample.batch_size = 1
     # sample.num_batches_per_epoch = 2
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
-    train.batch_size = 2
+    train.batch_size = 1
     train.use_8bit_adam = False
     train.learning_rate = 3e-4
     train.adam_beta1 = 0.9
     train.adam_beta2 = 0.999
     train.adam_weight_decay = 1e-4
     train.adam_epsilon = 1e-8
-    train.gradient_accumulation_steps = 1
+    train.gradient_accumulation_steps = 2
     train.max_grad_norm = 1.0
     train.num_inner_epochs = 1
     train.cfg = True
@@ -79,7 +79,7 @@ def get_config():
     config.per_prompt_stat_tracking.min_count = 16
 
     # ... other config ...
-    train.kl_lambda = 1  # or another value for KL loss strength
+    train.kl_lambda = 0 # or another value for KL loss strength
 
     config.progressive_steps = [50, 25, 12, 5]
 

@@ -97,7 +97,11 @@ def main(_):
     config.run_name = config.run_name or unique_id
     config.run_name += f"_distill_{unique_id}"
 
-    reward_types = ["clip", "dino", "text_image", "aesthetic"]
+    config.train.clip_epsilon = getattr(config.train, "clip_epsilon", 0.2) # Epsilon for PPO clipping
+    config.train.kl_beta = getattr(config.train, "kl_beta", 0.04) # Beta for KL penalty
+
+    #"dino", "text_image", "aesthetic"
+    reward_types = ["clip"]
 
     outdir = "GRPO_" + "_".join(reward_types)
     kl_lambda = getattr(config.train, "kl_lambda", 1.0) 
@@ -241,7 +245,7 @@ def main(_):
 
     reward_fn = get_reward_fn(reward_types, teacher_pipeline, student_pipeline)
 
-    group_size = getattr(config.train, "group_size", 4)  # default group size
+    group_size = getattr(config.train, "group_size", 2)  # default group size
 
     for epoch in range(config.num_epochs):
         logger.info(f"Epoch {epoch}: Sampling and Training")
@@ -269,16 +273,13 @@ def main(_):
 
         # Teacher sampling
         with torch.no_grad():
-            teacher_out = pipeline_with_logprob(
-                teacher_pipeline,
+            teacher_images = teacher_pipeline(
                 prompt_embeds=prompt_embeds,
                 num_inference_steps=config.sample.num_steps,
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
-                output_type="pt",
-                return_all_latents=True,
-            )
-            teacher_images, _, teacher_latents_all, teacher_log_probs_all = teacher_out
+                output_type="pil",
+            ).images
 
         # Student sampling
         student_pipeline.unet.eval()
@@ -293,6 +294,7 @@ def main(_):
                 return_all_latents=True,
             )
             student_images, _, student_latents_all, student_log_probs_all = student_out
+            # baseline log_probs from the pipeline (usually final-step logprob per sample)
             baseline_log_probs = student_log_probs_all[-1]
 
         # Rewards
@@ -301,57 +303,92 @@ def main(_):
             device=accelerator.device,
         )
 
-        batch = config.sample.batch_size
-        batch_all = batch * group_size
+        batch_size = config.sample.batch_size
+
+        # <--- Implement advantage normalization as per Section 4.1.2
+        rewards_grouped = rewards.view(batch_size, group_size)
+        rewards_mean = rewards_grouped.mean(dim=1, keepdim=True)
+        rewards_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8 # Add epsilon for numerical stability
+        advantages_grouped = (rewards_grouped - rewards_mean)
+        advantages_flat = advantages_grouped.view(-1) # Flatten back to per-sample shape
+
         latents = torch.stack(student_latents_all, dim=1)
-        timesteps = student_pipeline.scheduler.timesteps.repeat(batch_all, 1)
+        # <--- Store the log probabilities from the sampling step (`π_θ_old`)
+        old_log_probs = torch.stack(student_log_probs_all, dim=1)
+        
+        timesteps = student_pipeline.scheduler.timesteps.repeat(batch_size * group_size, 1)
 
-        aligned_teacher_log_probs = torch.stack(teacher_log_probs_all, dim=1)
-        aligned_student_log_probs = torch.stack(student_log_probs_all, dim=1)
-        if aligned_teacher_log_probs.shape[1] != aligned_student_log_probs.shape[1]:
-            aligned_teacher_log_probs = torch.nn.functional.interpolate(
-                aligned_teacher_log_probs.unsqueeze(1),
-                size=aligned_student_log_probs.shape[1],
-                mode="linear",
-                align_corners=True,
-            ).squeeze(1)
 
-        kl_loss_total = torch.nn.functional.kl_div(
-            aligned_student_log_probs,
-            aligned_teacher_log_probs,
-            reduction="batchmean",
-            log_target=True,
-        )
+        logger.info(f"Epoch {epoch}: Training")
+        student_pipeline.unet.train()
+        
+        # Accumulate loss over all timesteps
+        total_policy_loss = 0
+        total_kl_loss = 0
 
-        # Group-relative advantages
-        rewards_grouped = rewards.view(batch, group_size)
-        advantages_grouped = rewards_grouped - rewards_grouped.mean(dim=1, keepdim=True)
-        advantages_flat = advantages_grouped.view(batch_all)
+        old_log_probs = old_log_probs.detach()
 
+        # Training loop over timesteps: keep the DDIM step with logprob as in PPO flow
         student_pipeline.unet.train()
         for j in range(config.student.num_steps):
             with accelerator.accumulate(unet):
                 with accelerator.autocast():
+                    # unet expects latents for current step; latents shape [batch_all, seq_len, ...]
                     noise_pred = unet(latents[:, j], timesteps[:, j], prompt_embeds).sample
-                    _, log_prob = ddim_step_with_logprob(
+
+                    # compute the log_prob for this step using the DDIM helper (SDE->ODE conversion)
+                    # prev_sample argument matches the pipeline order: next latent if available, else current
+                    _, current_log_prob = ddim_step_with_logprob(
                         student_pipeline.scheduler,
                         noise_pred,
                         timesteps[:, j],
                         latents[:, j],
                         eta=config.sample.eta,
                         prev_sample=latents[:, j+1] if j + 1 < latents.shape[1] else latents[:, j],
-                    )
-                log_prob = log_prob.view(batch_all)
-                loss_policy = -(advantages_flat.detach() * log_prob).mean()
-                total_loss = loss_policy + getattr(config.train, "kl_lambda", 1.0) * kl_loss_total
+                    )                    
 
-                accelerator.backward(total_loss)
-                if accelerator.sync_gradients:
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
+                current_log_prob = current_log_prob.view(-1)
+            
+                # --- Policy Loss with PPO Clipping (Equation 3) ---
+                # Ratio of probabilities `π_θ(a|s) / π_θ_old(a|s)`
+                ratio = torch.exp(current_log_prob - old_log_probs[:, j])
+                
+                # Detach advantages so no gradients flow into the reward calculation
+                advantages = advantages_flat.detach()
 
-        total_loss_val = total_loss.item() if 'total_loss' in locals() else 0.0
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1.0 - config.train.clip_epsilon, 1.0 + config.train.clip_epsilon) * advantages
+                
+                # The policy loss is the negative of the minimum of the two surrogate objectives
+                step_policy_loss = -torch.min(surr1, surr2).mean()
+                total_policy_loss += step_policy_loss
+                
+                # --- KL Divergence Penalty (Equation 3 & 4) ---
+                # The paper's reference model `π_ref` is the SFT model. Here, we use `π_θ_old`
+                # (the policy at the start of the batch) as the reference for regularization.
+                log_ratio = old_log_probs[:, j] - current_log_prob
+                # Unbiased estimator for KL divergence from the paper (Equation 4)
+                # D_KL(π_ref || π_θ) ≈ (π_ref / π_θ) - log(π_ref / π_θ) - 1
+                kl_penalty_step = (torch.exp(log_ratio) - log_ratio - 1).mean()
+                total_kl_loss += kl_penalty_step
+
+        # Average the losses over the number of timesteps
+        avg_policy_loss = total_policy_loss / config.student.num_steps
+        avg_kl_loss = total_kl_loss / config.student.num_steps
+
+        # Combine the losses
+        total_loss = avg_policy_loss + config.train.kl_beta * avg_kl_loss
+
+        # Perform a single backward pass for the entire trajectory
+        with accelerator.accumulate(unet):
+            accelerator.backward(total_loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+        
+
+        total_loss_val = total_loss.item()
         all_losses.append(total_loss_val)
         all_rewards.append(rewards.mean().item())
         all_rewards_std.append(rewards.std().item())
@@ -366,12 +403,14 @@ def main(_):
 
         if accelerator.is_main_process:
             eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
-                "A futuristic city skyline at night",
-                "A dragon flying over mountains",
-                "A cozy cabin in a snowy forest",
-            ]
+                "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
+                "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
+                "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
+                "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
+                "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
+                "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
+                "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                ]
 
             with torch.no_grad():
                 with accelerator.autocast():

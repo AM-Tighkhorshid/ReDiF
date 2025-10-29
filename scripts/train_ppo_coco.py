@@ -30,25 +30,37 @@ import cv2
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
+    student_dir = os.path.join(outdir, "student_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+
+    os.makedirs(student_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
 
     for idx in range(min(len(student_images), len(teacher_images))):
         s_img = student_images[idx].convert("RGB")
         t_img = teacher_images[idx].convert("RGB")
 
+        # Resize both to the same square size
         h = min(s_img.height, t_img.height)
         s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
         t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
 
+        # Save student-only image
+        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
+        s_img.save(student_path)
+        print(f"Saved student image: {student_path}")
+
+        # Create side-by-side combined image
         combined = Image.new("RGB", (t_img.width + s_img.width, h))
         combined.paste(t_img, (0, 0))
         combined.paste(s_img, (t_img.width, 0))
 
-        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(outpath)
-        print(f"Saved {outpath}")
-
+        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(combined_path)
+        print(f"Saved side-by-side image: {combined_path}")
 
 def js_divergence(p, q):
     p = F.softmax(p, dim=-1)
@@ -96,7 +108,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_enum(
     "divergence_type",
-    default="renyi",
+    default="kl",
     enum_values=["kl", "js", "chi2", "power", "renyi"],
     help="Divergence function to use for PPO regularization."
 )
@@ -160,6 +172,8 @@ def main(_):
         project_config=accelerator_config,
         gradient_accumulation_steps=config.train.gradient_accumulation_steps * config.student.num_steps,
     )
+
+    set_seed(config.seed, device_specific=True)
 
     if accelerator.is_main_process:
         accelerator.init_trackers("ddpo-distill", config=config.to_dict())
@@ -413,12 +427,15 @@ def main(_):
 
         if accelerator.is_main_process:
             eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
+                "A glass bowl filled with oranges on a table",
+                "A cat pausing as it's picture is taken",
                 "A futuristic city skyline at night",
-                "A dragon flying over mountains",
+                "A Marine that is looking at his cell phone",
                 "A cozy cabin in a snowy forest",
+                "A motorcycle is parked near a puddle and a van"
             ]
+
+            # generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
 
             with torch.no_grad():
                 with accelerator.autocast():
@@ -427,6 +444,7 @@ def main(_):
                             prompt,
                             num_inference_steps=config.sample.num_steps,
                             guidance_scale=config.sample.guidance_scale,
+                            # generator=generator
                         ).images[0]
                         for prompt in eval_prompts
                     ]
@@ -436,6 +454,7 @@ def main(_):
                             prompt,
                             num_inference_steps=config.student.num_steps,
                             guidance_scale=config.sample.guidance_scale,
+                            # generator=generator
                         ).images[0]
                         for prompt in eval_prompts
                     ]
