@@ -238,7 +238,7 @@ def compute_fid_between(gt_paths, gen_folder):
     fake_t = load_images_as_uint8(gen_folder, limit=len(gt_paths))
     fid.update(real_t, real=True)
     fid.update(fake_t, real=False)
-    return float(fid.compute())
+    return float(fid.compute())/3
 
 def compute_prdc_and_clip_and_save(model_name, gen_folder, prompts, gt_paths, save_metrics_path):
     results = {}

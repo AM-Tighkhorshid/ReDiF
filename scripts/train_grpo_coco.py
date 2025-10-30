@@ -33,22 +33,34 @@ import random
 
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
+    student_dir = os.path.join(outdir, "student_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+
+    os.makedirs(student_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
 
     for idx in range(min(len(student_images), len(teacher_images))):
         s_img = student_images[idx].convert("RGB")
         t_img = teacher_images[idx].convert("RGB")
 
+        # Resize both to the same square size
         h = min(s_img.height, t_img.height)
         s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
         t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
 
+        # Save student-only image
+        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
+        s_img.save(student_path)
+        print(f"Saved student image: {student_path}")
+
+        # Create side-by-side combined image
         combined = Image.new("RGB", (t_img.width + s_img.width, h))
         combined.paste(t_img, (0, 0))
         combined.paste(s_img, (t_img.width, 0))
 
-        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(outpath)
-        print(f"Saved {outpath}")
+        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(combined_path)
+        print(f"Saved side-by-side image: {combined_path}")
 
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
@@ -100,10 +112,15 @@ def main(_):
     config.train.clip_epsilon = getattr(config.train, "clip_epsilon", 0.2) # Epsilon for PPO clipping
     config.train.kl_beta = getattr(config.train, "kl_beta", 0.04) # Beta for KL penalty
 
+    dr_grpo_flag = getattr(config.train, "dr_grpo_flag", True)
+
     #"dino", "text_image", "aesthetic"
     reward_types = ["clip"]
 
-    outdir = "GRPO_" + "_".join(reward_types)
+    if dr_grpo_flag:
+        outdir = "dr_"
+
+    outdir = outdir + "GRPO_" + "_".join(reward_types)
     kl_lambda = getattr(config.train, "kl_lambda", 1.0) 
     if kl_lambda != 0:
         outdir = outdir + "_kl_" + str(kl_lambda)
@@ -309,7 +326,10 @@ def main(_):
         rewards_grouped = rewards.view(batch_size, group_size)
         rewards_mean = rewards_grouped.mean(dim=1, keepdim=True)
         rewards_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8 # Add epsilon for numerical stability
-        advantages_grouped = (rewards_grouped - rewards_mean)
+        if dr_grpo_flag == False:
+            advantages_grouped = (rewards_grouped - rewards_mean)/rewards_std
+        else:
+            advantages_grouped = (rewards_grouped - rewards_mean)
         advantages_flat = advantages_grouped.view(-1) # Flatten back to per-sample shape
 
         latents = torch.stack(student_latents_all, dim=1)
@@ -322,22 +342,22 @@ def main(_):
         logger.info(f"Epoch {epoch}: Training")
         student_pipeline.unet.train()
         
-        # Accumulate loss over all timesteps
-        total_policy_loss = 0
-        total_kl_loss = 0
+        # --- These will be python floats for logging ---
+        total_policy_loss_epoch = 0.0
+        total_kl_loss_epoch = 0.0
 
         old_log_probs = old_log_probs.detach()
 
-        # Training loop over timesteps: keep the DDIM step with logprob as in PPO flow
+        # Training loop over timesteps
         student_pipeline.unet.train()
         for j in range(config.student.num_steps):
+            # The accumulate context manager wraps EACH step
             with accelerator.accumulate(unet):
                 with accelerator.autocast():
                     # unet expects latents for current step; latents shape [batch_all, seq_len, ...]
                     noise_pred = unet(latents[:, j], timesteps[:, j], prompt_embeds).sample
 
-                    # compute the log_prob for this step using the DDIM helper (SDE->ODE conversion)
-                    # prev_sample argument matches the pipeline order: next latent if available, else current
+                    # compute the log_prob for this step
                     _, current_log_prob = ddim_step_with_logprob(
                         student_pipeline.scheduler,
                         noise_pred,
@@ -350,54 +370,54 @@ def main(_):
                 current_log_prob = current_log_prob.view(-1)
             
                 # --- Policy Loss with PPO Clipping (Equation 3) ---
-                # Ratio of probabilities `π_θ(a|s) / π_θ_old(a|s)`
                 ratio = torch.exp(current_log_prob - old_log_probs[:, j])
-                
-                # Detach advantages so no gradients flow into the reward calculation
                 advantages = advantages_flat.detach()
-
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1.0 - config.train.clip_epsilon, 1.0 + config.train.clip_epsilon) * advantages
                 
-                # The policy loss is the negative of the minimum of the two surrogate objectives
                 step_policy_loss = -torch.min(surr1, surr2).mean()
-                total_policy_loss += step_policy_loss
                 
                 # --- KL Divergence Penalty (Equation 3 & 4) ---
-                # The paper's reference model `π_ref` is the SFT model. Here, we use `π_θ_old`
-                # (the policy at the start of the batch) as the reference for regularization.
                 log_ratio = old_log_probs[:, j] - current_log_prob
-                # Unbiased estimator for KL divergence from the paper (Equation 4)
-                # D_KL(π_ref || π_θ) ≈ (π_ref / π_θ) - log(π_ref / π_θ) - 1
                 kl_penalty_step = (torch.exp(log_ratio) - log_ratio - 1).mean()
-                total_kl_loss += kl_penalty_step
 
-        # Average the losses over the number of timesteps
-        avg_policy_loss = total_policy_loss / config.student.num_steps
-        avg_kl_loss = total_kl_loss / config.student.num_steps
+                # --- Combine loss for this step ---
+                total_step_loss = step_policy_loss + config.train.kl_beta * kl_penalty_step
 
-        # Combine the losses
-        total_loss = avg_policy_loss + config.train.kl_beta * avg_kl_loss
+                # --- Average the loss over timesteps ---
+                # We divide by num_steps here so the gradient is scaled correctly
+                # as we are backpropping on each step.
+                avg_step_loss = total_step_loss / config.student.num_steps
 
-        # Perform a single backward pass for the entire trajectory
-        with accelerator.accumulate(unet):
-            accelerator.backward(total_loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
+                # --- Perform backward pass INSIDE the loop ---
+                # accelerator will handle accumulation and stepping
+                accelerator.backward(avg_step_loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                
+                optimizer.step()
+                optimizer.zero_grad()
+
+                # --- Accumulate python floats for logging ---
+                total_policy_loss_epoch += step_policy_loss.item()
+                total_kl_loss_epoch += kl_penalty_step.item()
         
+        # --- End of j loop ---
 
-        total_loss_val = total_loss.item()
+        # Now, calculate final loss for logging
+        avg_policy_loss = total_policy_loss_epoch / config.student.num_steps
+        avg_kl_loss = total_kl_loss_epoch / config.student.num_steps
+        total_loss_val = avg_policy_loss + config.train.kl_beta * avg_kl_loss
+
         all_losses.append(total_loss_val)
         all_rewards.append(rewards.mean().item())
         all_rewards_std.append(rewards.std().item())
 
         with open(stats_file, "a") as f:
-            f.write(f"Epoch {epoch}: Loss={total_loss_val:.6f}, Reward_mean={rewards.mean().item():.6f}, Reward_std={rewards.std().item():.6f}")
+            f.write(f"Epoch {epoch}: Loss={total_loss_val:.6f}, Reward_mean={rewards.mean().item():.6f}, Reward_std={rewards.std().item():.6f}\n") # Added newline
 
         print(f"Epoch {epoch}: Reward mean = {rewards.mean().item():.4f}, Reward std = {rewards.std().item():.4f}")
-
+        
         if epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state(config.student_output_dir)
 

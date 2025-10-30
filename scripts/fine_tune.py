@@ -15,14 +15,14 @@ import json
 # Config
 # ============================================================
 DATA_ROOT = "./coco_dataset"
-TRAIN_IMAGES = os.path.join(DATA_ROOT, "test2017")
-ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_test2017.json")
-MODEL_NAME = "/media/external20/amirhossein_tighkhorshid/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
-OUTPUT_DIR = "./checkpoints"
+TRAIN_IMAGES = os.path.join(DATA_ROOT, "val2017")
+ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_val2017.json")
+MODEL_NAME = "/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/checkpoints/epoch_9"
+OUTPUT_DIR = "./checkpoints2"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # === تغییرات کلیدی در Config ===
-EPOCHS = 40                # افزایش اپوک‌ها برای تمرین کامل
+EPOCHS = 30                # افزایش اپوک‌ها برای تمرین کامل
 BATCH_SIZE = 16            # ثابت (بستگی به VRAM شما دارد)
 # NUM_SAMPLES_PER_EPOCH = 10_000 # حذف شد، از کل دیتاست استفاده می‌کنیم
 IMAGE_SIZE = 512

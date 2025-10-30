@@ -76,7 +76,7 @@ def main(_):
     config.run_name = config.run_name or unique_id
     config.run_name += f"_distill_{unique_id}"
 
-    reward_types = ["clip", "dino", "text_image", "aesthetic"]
+    reward_types = ["clip"]
     outdir = "PPO_" + "_".join(reward_types)
     kl_lambda = getattr(config.train, "kl_lambda", 1.0) 
     if kl_lambda != 0:
