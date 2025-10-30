@@ -125,7 +125,7 @@ def main(_):
     if kl_lambda != 0:
         outdir = outdir + "_kl_" + str(kl_lambda)
     if FLAGS.prompt_source == "coco":
-        outdir = outdir + "_coco_prompts"
+        outdir = outdir + "_coco_prompts_batch2"
     else:
         outdir = outdir + "_ddpo_prompts"
     stats_dir = outdir

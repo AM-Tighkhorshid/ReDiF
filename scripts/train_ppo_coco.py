@@ -386,6 +386,8 @@ def main(_):
         #     log_target=True
         # )
 
+        avg_kl_per_step = kl_loss_total / config.student.num_steps
+
         student_pipeline.unet.train()
         for j in range(config.student.num_steps):
             with accelerator.accumulate(unet):
@@ -401,13 +403,13 @@ def main(_):
                     )
                 adv = torch.clamp(advantages, -config.train.adv_clip_max, config.train.adv_clip_max)
                 print(advantages)
-                ratio = torch.exp(log_prob - log_probs)
+                ratio = torch.exp(log_prob - aligned_student_log_probs[:, j])
                 unclipped = -adv * ratio
                 print(ratio)
                 clipped = -adv * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
                 loss = torch.mean(torch.maximum(unclipped, clipped))
 
-                total_loss = loss + getattr(config.train, "kl_lambda", 1.0) * kl_loss_total
+                total_loss = loss + getattr(config.train, "kl_lambda", 1.0) * avg_kl_per_step
 
                 accelerator.backward(total_loss)
                 if accelerator.sync_gradients:
@@ -427,13 +429,14 @@ def main(_):
 
         if accelerator.is_main_process:
             eval_prompts = [
-                "A glass bowl filled with oranges on a table",
-                "A cat pausing as it's picture is taken",
-                "A futuristic city skyline at night",
-                "A Marine that is looking at his cell phone",
-                "A cozy cabin in a snowy forest",
-                "A motorcycle is parked near a puddle and a van"
-            ]
+                "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
+                "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
+                "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
+                "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
+                "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
+                "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
+                "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                ]
 
             # generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
 
