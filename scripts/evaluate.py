@@ -22,10 +22,10 @@ parser.add_argument("--split", choices=["val", "test"], default="val", help="Dat
 parser.add_argument("--coco_root", default="coco_dataset", help="Root folder of COCO dataset")
 parser.add_argument("--laion_root", default="laion_dataset", help="Root folder of LAION dataset")
 parser.add_argument("--num_images", type=int, default=100, help="Number of images to evaluate")
-parser.add_argument("--teacher_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/checkpoints/epoch_5", help="Teacher model directory")
-parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/output/distill_clip/teacher_model", help="Student model directory")
+parser.add_argument("--teacher_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/output/distill_clip/teacher_model", help="Teacher model directory")
+parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/dr_GRPO_clip_coco_prompts_old_code_for_test/student_model", help="Student model directory")
 parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
-parser.add_argument("--student_steps", type=int, default=50, help="Student diffusion steps")
+parser.add_argument("--student_steps", type=int, default=5, help="Student diffusion steps")
 
 args = parser.parse_args()
 
@@ -34,7 +34,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TEACHER_MODEL = args.teacher_model
 STUDENT_MODEL = args.student_model
 TEACHER_DIR = os.path.join(TEACHER_MODEL, "evaluation_images_teacher")
-STUDENT_DIR = os.path.join(STUDENT_MODEL, "evaluation_images_teacher")
+STUDENT_DIR = os.path.join(STUDENT_MODEL, "evaluation_images_student")
 os.makedirs(TEACHER_DIR, exist_ok=True)
 os.makedirs(STUDENT_DIR, exist_ok=True)
 

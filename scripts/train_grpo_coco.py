@@ -112,20 +112,21 @@ def main(_):
     config.train.clip_epsilon = getattr(config.train, "clip_epsilon", 0.2) # Epsilon for PPO clipping
     config.train.kl_beta = getattr(config.train, "kl_beta", 0.04) # Beta for KL penalty
 
-    dr_grpo_flag = getattr(config.train, "dr_grpo_flag", True)
+    dr_grpo_flag = getattr(config.train, "dr_grpo_flag", False)
 
     #"dino", "text_image", "aesthetic"
     reward_types = ["clip"]
 
     if dr_grpo_flag:
         outdir = "dr_"
-
+    else:
+        outdir = ""
     outdir = outdir + "GRPO_" + "_".join(reward_types)
     kl_lambda = getattr(config.train, "kl_lambda", 1.0) 
     if kl_lambda != 0:
         outdir = outdir + "_kl_" + str(kl_lambda)
     if FLAGS.prompt_source == "coco":
-        outdir = outdir + "_coco_prompts_batch2"
+        outdir = outdir + "_coco_prompts2"
     else:
         outdir = outdir + "_ddpo_prompts"
     stats_dir = outdir
