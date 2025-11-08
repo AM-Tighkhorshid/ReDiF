@@ -112,7 +112,7 @@ def main(_):
     config.train.clip_epsilon = getattr(config.train, "clip_epsilon", 0.2) # Epsilon for PPO clipping
     config.train.kl_beta = getattr(config.train, "kl_beta", 0.04) # Beta for KL penalty
 
-    dr_grpo_flag = getattr(config.train, "dr_grpo_flag", False)
+    dr_grpo_flag = getattr(config.train, "dr_grpo_flag", True)
 
     #"dino", "text_image", "aesthetic"
     reward_types = ["clip"]
@@ -126,7 +126,7 @@ def main(_):
     if kl_lambda != 0:
         outdir = outdir + "_kl_" + str(kl_lambda)
     if FLAGS.prompt_source == "coco":
-        outdir = outdir + "_coco_prompts2"
+        outdir = outdir + "_coco_prompts"
     else:
         outdir = outdir + "_ddpo_prompts"
     stats_dir = outdir
@@ -263,7 +263,7 @@ def main(_):
 
     reward_fn = get_reward_fn(reward_types, teacher_pipeline, student_pipeline)
 
-    group_size = getattr(config.train, "group_size", 2)  # default group size
+    group_size = getattr(config.train, "group_size", 4)  # default group size
 
     for epoch in range(config.num_epochs):
         logger.info(f"Epoch {epoch}: Sampling and Training")
@@ -374,8 +374,8 @@ def main(_):
                 ratio = torch.exp(current_log_prob - old_log_probs[:, j])
                 advantages = advantages_flat.detach()
                 surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - config.train.clip_epsilon, 1.0 + config.train.clip_epsilon) * advantages
-                
+                # surr2 = torch.clamp(ratio, 1.0 - config.train.clip_epsilon, 1.0 + config.train.clip_epsilon) * advantages
+                surr2 = surr1
                 step_policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # --- KL Divergence Penalty (Equation 3 & 4) ---

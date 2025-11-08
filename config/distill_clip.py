@@ -79,7 +79,7 @@ def get_config():
     config.per_prompt_stat_tracking.min_count = 16
 
     # ... other config ...
-    train.kl_lambda = 1.0 # or another value for KL loss strength
+    train.kl_lambda = 0 # or another value for KL loss strength
 
     config.progressive_steps = [50, 25, 12, 5]
 
@@ -109,12 +109,12 @@ def get_config():
 
     # Number of sampling steps per stage of progressive distillation
     # (the paper uses this halving schedule)
-    config.distill.steps_list = [50, 25, 12, 5]
+    config.distill.steps_list = [25, 12, 5]
 
     # Number of gradient updates (iterations) for each distillation stage
     # You can increase to 50000+ for high-quality results;
     # smaller values like 5000 are good for debugging.
-    config.distill.updates_per_stage = 5
+    config.distill.updates_per_stage = 10
 
     # =================================
 
@@ -129,4 +129,7 @@ def get_config():
     config.gan.lr = 1e-4
     config.gan.n_layers = 3
 
+
+    #consistency
+    config.train.num_steps_per_epoch = 100
     return config

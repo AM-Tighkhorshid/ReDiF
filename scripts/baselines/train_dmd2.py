@@ -35,22 +35,34 @@ import torch.nn as nn
 
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
+    student_dir = os.path.join(outdir, "student_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+
+    os.makedirs(student_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
 
     for idx in range(min(len(student_images), len(teacher_images))):
         s_img = student_images[idx].convert("RGB")
         t_img = teacher_images[idx].convert("RGB")
 
+        # Resize both to the same square size
         h = min(s_img.height, t_img.height)
         s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
         t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
 
+        # Save student-only image
+        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
+        s_img.save(student_path)
+        print(f"Saved student image: {student_path}")
+
+        # Create side-by-side combined image
         combined = Image.new("RGB", (t_img.width + s_img.width, h))
         combined.paste(t_img, (0, 0))
         combined.paste(s_img, (t_img.width, 0))
 
-        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(outpath)
-        print(f"Saved {outpath}")
+        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(combined_path)
+        print(f"Saved side-by-side image: {combined_path}")
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -190,10 +202,14 @@ def main(_):
             if name.startswith("mid_block"):
                 hidden_size = student_pipeline.unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
+                # --- FIX --- #
+                block_id = int(name[len("up_blocks."):].split(".")[0])
+                # --- END FIX --- #
                 hidden_size = list(reversed(student_pipeline.unet.config.block_out_channels))[block_id]
             elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
+                # --- FIX --- #
+                block_id = int(name[len("down_blocks."):].split(".")[0])
+                # --- END FIX --- #
                 hidden_size = student_pipeline.unet.config.block_out_channels[block_id]
             lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
         student_pipeline.unet.set_attn_processor(lora_attn_procs)
@@ -268,15 +284,9 @@ def main(_):
     # ------------------------------
     # Build mu_fake (full UNet copy) and its optimizer
     # ------------------------------
-    # Note: this is memory heavy; consider smaller mu_fake if needed
-    # ------------------------------
-    # Create mu_fake by deep-copying the student UNet (clean, independent copy)
-    # This avoids rebuilding from config and guarantees matching cross-attention dims.
-    # ------------------------------
     from copy import deepcopy
 
     # deep copy the entire UNet module (parameters, buffers, submodules)
-    # deepcopy will create independent tensors (no shared storage)
     mu_fake = deepcopy(student_pipeline.unet)
 
     # Ensure mu_fake parameters are trainable (and independent)
@@ -284,31 +294,15 @@ def main(_):
         p.requires_grad = True
 
     # If the student UNet was using LoRA processors, make sure mu_fake has its own copies.
-    # deepcopy usually handles this; but if student set custom attn processors, re-clone them:
     try:
         if hasattr(student_pipeline.unet, "attn_processors"):
             # clone processors dict so mu_fake doesn't reference the same processors
             mu_fake.set_attn_processor(deepcopy(student_pipeline.unet.attn_processors))
     except Exception:
-        # not critical; continue
         pass
 
-    # Move mu_fake to device/dtype (accelerator.prepare will also handle this, but move now if needed)
-    # We'll create its optimizer after prepare (so optimizer uses prepared params)
-    # Prepare mu_fake and its optimizer with the accelerator below
     fake_lr = getattr(config.train, "fake_lr", 1e-4)
     fake_optimizer = torch.optim.AdamW(mu_fake.parameters(), lr=fake_lr, betas=(0.9, 0.99))
-
-    # Now hand mu_fake and optimizer to accelerate.prepare along with other objects
-    # If you already prepared other models earlier, include mu_fake & fake_optimizer in the prepare call:
-    # Example (if you have a list to prepare): 
-    # mu_fake, fake_optimizer = accelerator.prepare(mu_fake, fake_optimizer)
-    #
-    # If you prepared earlier and cannot re-prepare, call:
-    # mu_fake = accelerator.prepare_model(mu_fake)
-    # fake_optimizer = accelerator.prepare_optimizer(fake_optimizer)
-    #
-    # Use whichever pattern matches exactly how you prepared other models in your script.
 
     # ------------------------------
     # Attach hook to capture mid-block bottleneck features of student UNet
@@ -345,7 +339,7 @@ def main(_):
             dummy_lat = torch.randn((dummy_bs, student_pipeline.unet.in_channels, lat_h, lat_w), device=accelerator.device, dtype=dtype)
             # run a forward to populate mid_feat_store
             with torch.no_grad():
-                _ = student_pipeline.unet(dummy_lat, torch.tensor([student_pipeline.scheduler.timesteps[0]], device=accelerator.device), encoder_hidden_states=torch.zeros((1,1,student_pipeline.text_encoder.config.hidden_size), device=accelerator.device))
+                _ = student_pipeline.unet(dummy_lat, torch.tensor([student_pipeline.scheduler.timesteps[0]], device=accelerator.device), encoder_hidden_states=torch.zeros((1,1,student_pipeline.text_encoder.config.hidden_size), device=accelerator.device, dtype=dtype))
             mid_feat = mid_feat_store.get("feat", None)
             if mid_feat is not None:
                 mid_ch = mid_feat.shape[1]
@@ -416,22 +410,24 @@ def main(_):
 
         student_pipeline.unet.eval()
         with accelerator.autocast():
-            student_out = pipeline_with_logprob(
-                student_pipeline,
-                prompt_embeds=prompt_embeds,
-                num_inference_steps=config.student.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                eta=config.sample.eta,
-                output_type="pt",
-                return_all_latents=True,
-            )
-            student_images, _, student_latents_all, student_log_probs_all = student_out
+            # Note: We must run student sampling *without* grads
+            # to get the *actual* student distribution for fake_mu and disc training.
+            with torch.no_grad():
+                student_out = pipeline_with_logprob(
+                    student_pipeline,
+                    prompt_embeds=prompt_embeds,
+                    num_inference_steps=config.student.num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    eta=config.sample.eta,
+                    output_type="pt",
+                    return_all_latents=True,
+                )
+                student_images, _, student_latents_all, student_log_probs_all = student_out
 
         # Stack latents: shape [B, steps, C, H, W]
         latents = torch.stack(student_latents_all, dim=1)
         # We'll use the last latent (most denoised) as student's generated clean latent for DMD operations
-        # For multi-step students you may choose different indexing
-        student_clean_latent = latents[:, -1].detach()  # detach for mu_fake updates; re-create differentiable path for generator updates
+        student_clean_latent = latents[:, -1].detach()  # detach for mu_fake updates
 
         # Choose a timestep t from teacher scheduler's timesteps
         teacher_sched = teacher_pipeline.scheduler
@@ -442,11 +438,17 @@ def main(_):
         # Sample noise
         noise = torch.randn_like(student_clean_latent)
 
-        # Create noisy latents using teacher scheduler if add_noise available, else fallback
+        # Create noisy latents using teacher scheduler
         try:
             noisy_latents = teacher_sched.add_noise(student_clean_latent, noise, timesteps)
         except Exception:
-            noisy_latents = student_clean_latent + noise
+            # Fallback if scheduler doesn't have add_noise
+            alphas_cumprod = teacher_sched.alphas_cumprod
+            alpha_val = alphas_cumprod[t_chosen].to(accelerator.device, dtype=dtype)
+            alpha_sqrt = alpha_val.sqrt()
+            sigma_sqrt = (1.0 - alpha_val).sqrt()
+            noisy_latents = alpha_sqrt * student_clean_latent + sigma_sqrt * noise
+
 
         # Compute teacher score (denoiser output) at noisy latents (no grad)
         with torch.no_grad():
@@ -455,87 +457,101 @@ def main(_):
         # --- Update mu_fake (fake score model) multiple times (TTUR) ---
         mu_fake.train()
         for k in range(fake_updates):
-            pred_noise = mu_fake(noisy_latents, timesteps, encoder_hidden_states=prompt_embeds).sample
-            loss_mu = F.mse_loss(pred_noise, noise)
-            fake_optimizer.zero_grad()
-            accelerator.backward(loss_mu)
-            fake_optimizer.step()
+            with accelerator.accumulate(mu_fake):
+                pred_noise = mu_fake(noisy_latents, timesteps, encoder_hidden_states=prompt_embeds).sample
+                loss_mu = F.mse_loss(pred_noise, noise)
+                fake_optimizer.zero_grad()
+                accelerator.backward(loss_mu)
+                fake_optimizer.step()
 
         # --- Update discriminator (on bottleneck features) if enabled ---
         disc_loss_val = 0.0
         if use_gan:
-            # try to obtain bottleneck features for real images: use teacher images as "real"
-            # encode teacher_images to latents
-            try:
-                with torch.no_grad():
-                    real_enc = student_pipeline.vae.encode(teacher_images).latent_dist.sample()
-            except Exception:
-                # fallback by converting and encoding
-                real_t = []
-                for im in teacher_images:
-                    arr = np.array(im).astype(np.float32) / 255.0
-                    t = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0).to(accelerator.device)
-                    real_t.append(t)
-                real_t = torch.cat(real_t, dim=0)
-                with torch.no_grad():
-                    real_enc = student_pipeline.vae.encode(real_t).latent_dist.sample()
+            disc.train()
+            with accelerator.accumulate(disc):
+                # try to obtain bottleneck features for real images: use teacher images as "real"
+                try:
+                    with torch.no_grad():
+                        real_enc_dist = student_pipeline.vae.encode(teacher_images)
+                        real_enc = real_enc_dist.latent_dist.sample()
+                except Exception:
+                    # fallback by converting and encoding
+                    real_t = []
+                    for im in teacher_images:
+                        arr = np.array(im).astype(np.float32) / 255.0
+                        t = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0).to(accelerator.device, dtype=dtype)
+                        real_t.append(t)
+                    real_t = torch.cat(real_t, dim=0)
+                    with torch.no_grad():
+                        real_enc = student_pipeline.vae.encode(real_t).latent_dist.sample()
+                
+                real_enc = real_enc * student_pipeline.vae.config.scaling_factor
 
-            # run forward through student unet to capture mid features
-            mid_feat_store["feat"] = None
-            _ = student_pipeline.unet(real_enc, timesteps, encoder_hidden_states=prompt_embeds)
-            real_feat = mid_feat_store.get("feat", None)
+                # run forward through student unet to capture mid features
+                mid_feat_store["feat"] = None
+                with torch.no_grad(): # Don't need grads for disc input
+                    _ = student_pipeline.unet(real_enc, timesteps, encoder_hidden_states=prompt_embeds)
+                real_feat = mid_feat_store.get("feat", None)
 
-            # fake features from student_clean_latent (generated latents)
-            mid_feat_store["feat"] = None
-            _ = student_pipeline.unet(student_clean_latent, timesteps, encoder_hidden_states=prompt_embeds)
-            fake_feat = mid_feat_store.get("feat", None)
+                # fake features from student_clean_latent (generated latents)
+                mid_feat_store["feat"] = None
+                with torch.no_grad(): # Don't need grads for disc input
+                    _ = student_pipeline.unet(student_clean_latent.detach(), timesteps, encoder_hidden_states=prompt_embeds)
+                fake_feat = mid_feat_store.get("feat", None)
 
-            if (real_feat is not None) and (fake_feat is not None):
-                real_logit = disc(real_feat.detach())
-                fake_logit = disc(fake_feat.detach())
-                d_loss = F.softplus(-real_logit).mean() + F.softplus(fake_logit).mean()
-                disc_optimizer.zero_grad()
-                accelerator.backward(d_loss)
-                disc_optimizer.step()
-                disc_loss_val = d_loss.item()
-            else:
-                disc_loss_val = 0.0
+                if (real_feat is not None) and (fake_feat is not None):
+                    real_logit = disc(real_feat.detach())
+                    fake_logit = disc(fake_feat.detach())
+                    d_loss = F.softplus(-real_logit).mean() + F.softplus(fake_logit).mean()
+                    disc_optimizer.zero_grad()
+                    accelerator.backward(d_loss)
+                    disc_optimizer.step()
+                    disc_loss_val = d_loss.item()
+                else:
+                    disc_loss_val = 0.0
+                    if real_feat is None: logger.warning("Disc update skipped: real_feat is None.")
+                    if fake_feat is None: logger.warning("Disc update skipped: fake_feat is None.")
+
 
         # --- Generator update (student) ---
-        # Create a differentiable path from random z -> student UNet -> pred_x0 -> noisy_for_gen -> mu_fake -> loss
-        # This is a practical surrogate that allows gradient to flow into student UNet.
+        # Set student model to train
+        student_pipeline.unet.train()
+        if config.use_lora:
+            unet.train()
+            
         optimizer.zero_grad()
         with accelerator.accumulate(unet):
-            # random latents z
+            # random latents z (start point for 1-step differentiable generation)
             z = torch.randn_like(student_clean_latent, device=accelerator.device)
+            
             # student predicts noise / denoised output from z at t
-            pred_eps = student_pipeline.unet(z, timesteps, encoder_hidden_states=prompt_embeds).sample
+            # This is the 1-step generation pass where grads are kept
+            pred_eps = unet(z, timesteps, encoder_hidden_states=prompt_embeds).sample
 
-            # attempt to reconstruct x0_est from predicted eps using scheduler alpha/sigma if possible
-            # Otherwise, use simple heuristic pred_x0 = z - pred_eps
+            # reconstruct x0_est from predicted eps
             pred_x0 = None
             try:
-                # Try to find alpha/sigma mapping in teacher_sched; this is scheduler-specific
-                if hasattr(teacher_sched, "alphas_cumprod"):
-                    # map timestep to index and get alpha
-                    tt_index = list(teacher_sched.timesteps).index(t_chosen) if t_chosen in teacher_sched.timesteps else 0
-                    alphas_cumprod = teacher_sched.alphas_cumprod
-                    alpha_val = float(alphas_cumprod[tt_index])
-                    alpha_tensor = torch.tensor(alpha_val, device=accelerator.device, dtype=z.dtype)
-                    # If we can compute sigma from alpha:
-                    sigma_tensor = torch.sqrt(1.0 - alpha_tensor)
-                    # reconstruct x0
-                    pred_x0 = (z - sigma_tensor * pred_eps) / (alpha_tensor.sqrt() + 1e-12)
-                else:
-                    pred_x0 = z - pred_eps
-            except Exception:
+                alphas_cumprod = teacher_sched.alphas_cumprod
+                alpha_val = alphas_cumprod[t_chosen].to(accelerator.device, dtype=z.dtype)
+                alpha_tensor = alpha_val.sqrt()
+                sigma_tensor = (1.0 - alpha_val).sqrt()
+                # reconstruct x0
+                pred_x0 = (z - sigma_tensor * pred_eps) / (alpha_tensor + 1e-12)
+            except Exception as e:
+                logger.warning(f"Failed to use scheduler alphas for x0 recon: {e}. Falling back.")
                 pred_x0 = z - pred_eps
 
             # create noisy_for_gen via teacher scheduler
             try:
                 noisy_for_gen = teacher_sched.add_noise(pred_x0, noise, timesteps)
             except Exception:
-                noisy_for_gen = pred_x0 + noise
+                # Fallback
+                alphas_cumprod = teacher_sched.alphas_cumprod
+                alpha_val = alphas_cumprod[t_chosen].to(accelerator.device, dtype=dtype)
+                alpha_sqrt = alpha_val.sqrt()
+                sigma_sqrt = (1.0 - alpha_val).sqrt()
+                noisy_for_gen = alpha_sqrt * pred_x0 + sigma_sqrt * noise
+
 
             # mu_fake prediction (train mode for gradient path)
             mu_fake.train()
@@ -547,14 +563,18 @@ def main(_):
             # GAN generator loss (if enabled)
             gen_gan_loss_val = 0.0
             if use_gan:
+                disc.eval() # Disc is frozen during gen update
                 mid_feat_store["feat"] = None
+                # Run student unet *again* on the differentiable pred_x0
                 _ = student_pipeline.unet(pred_x0, timesteps, encoder_hidden_states=prompt_embeds)
                 mid_feat_for_gen = mid_feat_store.get("feat", None)
+                
                 if mid_feat_for_gen is not None:
                     fake_logit_for_gen = disc(mid_feat_for_gen)
                     gen_gan_loss = F.softplus(-fake_logit_for_gen).mean()
                     gen_gan_loss_val = gen_gan_loss.item()
                 else:
+                    logger.warning("Gen GAN loss skipped: mid_feat_for_gen is None.")
                     gen_gan_loss = torch.tensor(0.0, device=accelerator.device)
             else:
                 gen_gan_loss = torch.tensor(0.0, device=accelerator.device)
@@ -581,12 +601,14 @@ def main(_):
         # Monitoring images & saving — preserved exactly like PPO template
         if accelerator.is_main_process:
             eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
-                "A futuristic city skyline at night",
-                "A dragon flying over mountains",
-                "A cozy cabin in a snowy forest",
-            ]
+                    "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
+                    "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
+                    "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
+                    "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
+                    "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
+                    "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
+                    "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                    ]
 
             with torch.no_grad():
                 with accelerator.autocast():
@@ -617,24 +639,27 @@ def main(_):
                 logger.warning(f"Failed to save student pipeline at epoch {epoch}: {e}")
 
     # After training: plot losses (same plotting style as PPO)
-    epochs = range(len(all_losses))
-    plt.figure()
-    plt.plot(epochs, all_losses, label="Gen loss")
-    plt.plot(epochs, all_dmd_losses, label="DMD loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training Loss")
-    plt.legend()
-    plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
-    plt.close()
+    if accelerator.is_main_process:
+        epochs = range(len(all_losses))
+        plt.figure()
+        plt.plot(epochs, all_losses, label="Gen loss")
+        plt.plot(epochs, all_dmd_losses, label="DMD loss")
+        plt.plot(epochs, all_gen_gan_losses, label="Gen GAN loss")
+        plt.plot(epochs, all_disc_losses, label="Disc loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Loss")
+        plt.legend()
+        plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
+        plt.close()
 
-    # Save training stats json
-    try:
-        import json as _json
-        with open(os.path.join(stats_dir, "training_losses.json"), "w") as f:
-            _json.dump({"gen": all_losses, "dmd": all_dmd_losses, "gen_gan": all_gen_gan_losses, "disc": all_disc_losses}, f)
-    except Exception:
-        pass
+        # Save training stats json
+        try:
+            import json as _json
+            with open(os.path.join(stats_dir, "training_losses.json"), "w") as f:
+                _json.dump({"gen": all_losses, "dmd": all_dmd_losses, "gen_gan": all_gen_gan_losses, "disc": all_disc_losses}, f)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app.run(main)

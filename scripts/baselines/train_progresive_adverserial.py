@@ -60,18 +60,43 @@ logger = get_logger(__name__)
 # -------------------------
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
+
+    # Separate directories for clarity
+    student_dir = os.path.join(outdir, "student_only")
+    teacher_dir = os.path.join(outdir, "teacher_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+
+    os.makedirs(student_dir, exist_ok=True)
+    os.makedirs(teacher_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
+
     for idx in range(min(len(student_images), len(teacher_images))):
         s_img = student_images[idx].convert("RGB")
         t_img = teacher_images[idx].convert("RGB")
+
+        # Resize both to the same square size (keep consistent size)
         h = min(s_img.height, t_img.height)
         s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
         t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
+
+        # --- Save teacher-only image ---
+        teacher_path = os.path.join(teacher_dir, f"epoch{epoch}_teacher{idx}.png")
+        t_img.save(teacher_path)
+        print(f"Saved teacher image: {teacher_path}")
+
+        # --- Save student-only image ---
+        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
+        s_img.save(student_path)
+        print(f"Saved student image: {student_path}")
+
+        # --- Create side-by-side combined image ---
         combined = Image.new("RGB", (t_img.width + s_img.width, h))
         combined.paste(t_img, (0, 0))
         combined.paste(s_img, (t_img.width, 0))
-        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(outpath)
-        print(f"Saved {outpath}")
+
+        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(combined_path)
+        print(f"Saved side-by-side image: {combined_path}")
 
 def cosine_alpha_sigma(t):
     """t in [0,1] scalar or tensor -> (alpha, sigma)."""
@@ -326,7 +351,7 @@ def main(_):
 
     # Distillation hyperparams
     steps_list = getattr(config.distill, "steps_list", [50, 25, 12, 5])
-    updates_per_stage = getattr(config.train, "distill_updates_per_stage", 5)
+    updates_per_stage = getattr(config.train, "distill_updates_per_stage", 10)
     batch_size = config.sample.batch_size
     guidance_scale = getattr(config.sample, "guidance_scale", 1.0)
     teacher_steps = getattr(config.sample, "num_steps", 50)
@@ -519,12 +544,14 @@ def main(_):
         # Evaluation (kept unchanged style)
         if accelerator.is_main_process:
             eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
-                "A futuristic city skyline at night",
-                "A dragon flying over mountains",
-                "A cozy cabin in a snowy forest",
-            ]
+                    "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
+                    "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
+                    "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
+                    "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
+                    "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
+                    "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
+                    "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                    ]
             with torch.no_grad():
                 teacher_eval_images = [
                     teacher_pipeline(

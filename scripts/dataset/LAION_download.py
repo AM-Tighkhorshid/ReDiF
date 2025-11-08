@@ -35,10 +35,10 @@ from tqdm.auto import tqdm
 HF_DATASET = "laion/relaion1B-nolang-aesthetic"  # Hugging Face streaming dataset
 OUTPUT_ROOT = "/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/laion_dataset"
 TRAIN_SIZE = 10  # target number of train captions (no images downloaded for train)
-VAL_SIZE = 100
+VAL_SIZE = 1000
 TEST_SIZE = 10
 MAX_TRIES_PER_IMAGE = 3
-IMAGE_DOWNLOAD_TIMEOUT = 8  # seconds
+IMAGE_DOWNLOAD_TIMEOUT = 10  # seconds
 MIN_WORDS_IN_CAPTION = 3  # keep captions with at least this many words
 # -------------------------
 

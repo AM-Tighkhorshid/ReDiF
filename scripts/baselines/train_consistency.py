@@ -1,6 +1,6 @@
 # train_consistency.py
 # Consistency Distillation training implementation (based on Consistency Models paper)
-# Converted from your train_ppo_coco.py while keeping model loading, LoRA, evaluation, and output structure intact.
+# Corrected from the DDPO-hybrid version.
 
 from collections import defaultdict
 import contextlib
@@ -43,23 +43,45 @@ flags.DEFINE_enum("coco_split", "train", ["train", "val", "both"], "COCO caption
 flags.DEFINE_string("coco_annotations_dir", "coco_dataset/annotations", "COCO annotations directory")
 
 
-# ------------------------------
-# Utility functions
-# ------------------------------
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
+
+    # Separate directories for clarity
+    student_dir = os.path.join(outdir, "student_only")
+    teacher_dir = os.path.join(outdir, "teacher_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+
+    os.makedirs(student_dir, exist_ok=True)
+    os.makedirs(teacher_dir, exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
+
     for idx in range(min(len(student_images), len(teacher_images))):
         s_img = student_images[idx].convert("RGB")
         t_img = teacher_images[idx].convert("RGB")
+
+        # Resize both to the same square size (keep consistent size)
         h = min(s_img.height, t_img.height)
         s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
         t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
+
+        # --- Save teacher-only image ---
+        teacher_path = os.path.join(teacher_dir, f"epoch{epoch}_teacher{idx}.png")
+        t_img.save(teacher_path)
+        print(f"Saved teacher image: {teacher_path}")
+
+        # --- Save student-only image ---
+        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
+        s_img.save(student_path)
+        print(f"Saved student image: {student_path}")
+
+        # --- Create side-by-side combined image ---
         combined = Image.new("RGB", (t_img.width + s_img.width, h))
         combined.paste(t_img, (0, 0))
         combined.paste(s_img, (t_img.width, 0))
-        outpath = os.path.join(outdir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(outpath)
-        print(f"Saved {outpath}")
+
+        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
+        combined.save(combined_path)
+        print(f"Saved side-by-side image: {combined_path}")
 
 
 def compute_pred_original_sample(scheduler, model_output, timestep, sample, detach=False):
@@ -92,7 +114,53 @@ def compute_pred_original_sample(scheduler, model_output, timestep, sample, deta
     return pred_original_sample
 
 
+# -----------------------------------------------
+# NEW HELPER: Manual DDIM step
+# -----------------------------------------------
+def ddim_step_manual(scheduler, model_output, t, t_prev, sample, eta=0.0):
+    """
+    Performs a manual DDIM step from t to t_prev.
+    This is needed for the CD loss, to ensure the teacher's one-step
+    jump (t -> t_prev) is calculated correctly.
+    """
+    with torch.no_grad():
+        # Get alpha/beta values for t
+        alpha_prod_t = scheduler.alphas_cumprod.gather(0, t.cpu()).to(t.device)
+        alpha_prod_t = alpha_prod_t.reshape(alpha_prod_t.shape + (1,) * (sample.ndim - alpha_prod_t.ndim))
+        beta_prod_t = 1 - alpha_prod_t
+
+        # Get alpha/beta values for t_prev
+        alpha_prod_t_prev = scheduler.alphas_cumprod.gather(0, t_prev.cpu()).to(t.device)
+        alpha_prod_t_prev = alpha_prod_t_prev.reshape(alpha_prod_t_prev.shape + (1,) * (sample.ndim - alpha_prod_t_prev.ndim))
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+
+        # 1. Compute "predicted x_0"
+        #    (Same as compute_pred_original_sample)
+        pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / (alpha_prod_t ** 0.5)
+
+        # 2. Compute "direction pointing to x_t" (epsilon)
+        pred_epsilon = (sample - alpha_prod_t ** 0.5 * pred_original_sample) / (beta_prod_t ** 0.5)
+
+        # 3. Compute variance (sigma_t)
+        #    We use eta=0 for deterministic distillation
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        std_dev_t = eta * variance ** 0.5
+
+        # 4. Compute x_t_prev (x_{t_n})
+        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** 0.5 * pred_epsilon
+        prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
+
+        # Note: eta=0, so we don't add noise
+        # if eta > 0:
+        #     noise = torch.randn_like(model_output)
+        #     prev_sample = prev_sample + std_dev_t * noise
+
+        return prev_sample
+
+
 def align_teacher_student_steps(teacher_latents, student_latents, teacher_steps, student_steps):
+    # This function is no longer used by the CD loss, but kept for compatibility
+    # if other parts of the original code (e.g. logging) still use it.
     if isinstance(teacher_latents, list):
         teacher_latents = torch.stack(teacher_latents, dim=1)
     align_indices = torch.linspace(max(1, teacher_steps // student_steps), teacher_steps, steps=student_steps).long() - 1
@@ -115,8 +183,9 @@ def update_ema(ema_model, model, decay):
 # ------------------------------
 def main(_):
     config = FLAGS.config
-    config.student.num_steps = 5  # enforce 5 student steps
-
+    # NOTE: config.student.num_steps is now only used for EVALUATION
+    # The training process distills the 1-step model
+    
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     config.run_name = config.run_name or unique_id
     config.run_name += f"_cd_{unique_id}"
@@ -138,7 +207,8 @@ def main(_):
         log_with="wandb",
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * config.student.num_steps,
+        # Gradient accumulation is handled per-step in the new loop
+        gradient_accumulation_steps=1,
     )
     if accelerator.is_main_process:
         accelerator.init_trackers("cd-distill", config=config.to_dict())
@@ -147,7 +217,7 @@ def main(_):
     teacher_pipeline = StableDiffusionPipeline.from_pretrained(config.pretrained.model, revision=config.pretrained.revision)
     teacher_pipeline.scheduler = DDIMScheduler.from_config(teacher_pipeline.scheduler.config)
     teacher_pipeline.safety_checker = None
-    teacher_pipeline.set_progress_bar_config(disable=False)
+    teacher_pipeline.set_progress_bar_config(disable=True) # Disable for training
     teacher_pipeline.vae.to(accelerator.device)
     teacher_pipeline.text_encoder.to(accelerator.device)
     teacher_pipeline.unet.to(accelerator.device)
@@ -164,6 +234,10 @@ def main(_):
     student_pipeline.text_encoder.to(accelerator.device)
     student_pipeline.unet.to(accelerator.device)
 
+    # Freeze VAE and Text Encoder for student (we only train UNet)
+    student_pipeline.vae.requires_grad_(False)
+    student_pipeline.text_encoder.requires_grad_(False)
+
     if config.use_lora:
         lora_attn_procs = {}
         for name in student_pipeline.unet.attn_processors.keys():
@@ -178,6 +252,8 @@ def main(_):
                 hidden_size = student_pipeline.unet.config.block_out_channels[block_id]
             lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
         student_pipeline.unet.set_attn_processor(lora_attn_procs)
+        
+        # This wrapper and unet preparation is from the original DDPO code
         class _Wrapper(AttnProcsLayers):
             def forward(self, *args, **kwargs):
                 return student_pipeline.unet(*args, **kwargs)
@@ -219,7 +295,13 @@ def main(_):
                 data = json.load(f)
             coco_captions += [a["caption"] for a in data["annotations"] if "caption" in a]
 
+    # Reward function (for logging only)
     reward_fn = get_reward_fn(["clip", "text_image", "aesthetic"], teacher_pipeline, student_pipeline)
+
+    # Get the 1000-step timesteps from the scheduler
+    # This is crucial for sampling t_n and t_{n+1}
+    student_pipeline.scheduler.set_timesteps(student_pipeline.scheduler.config.num_train_timesteps)
+    all_timesteps = student_pipeline.scheduler.timesteps
 
     # ---------------- TRAINING LOOP ----------------
     for epoch in range(config.num_epochs):
@@ -240,8 +322,11 @@ def main(_):
             max_length=student_pipeline.tokenizer.model_max_length,
         ).input_ids.to(accelerator.device)
         prompt_embeds = student_pipeline.text_encoder(prompt_ids)[0]
+        prompt_embeds = prompt_embeds.detach() # Detach, we don't train text encoder
 
-        # teacher latents
+        # ----- Generate "Ground Truth" $x_0$ with Teacher -----
+        # We run the full teacher pipeline to get its $x_0$ latent prediction.
+        # This serves as the "clean" data to which we'll add noise for training.
         with torch.no_grad():
             teacher_out = pipeline_with_logprob(
                 teacher_pipeline,
@@ -250,33 +335,33 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                return_all_latents=True,
+                return_all_latents=True, # We need the latents
             )
             teacher_images, _, teacher_latents_all, _ = teacher_out
 
-        # student latents
+            # The final latent in the list is the predicted x0
+            # Stack them: [B, N_steps+1, C, H, W]
+            teacher_latents_stack = torch.stack(teacher_latents_all, dim=1)
+            # Get the last latent (x0) from each batch item
+            x0_latents = teacher_latents_stack[:, -1].detach() # [B, C, H, W]
+
+        # ----- Student Evaluation Run (for logging/rewards ONLY) -----
+        # This is kept from your original code to maintain the "fair setting"
+        # for logging rewards and std. It is NOT used in the CD loss.
         student_pipeline.unet.eval()
-        with accelerator.autocast():
+        with torch.no_grad(), accelerator.autocast():
             student_out = pipeline_with_logprob(
                 student_pipeline,
                 prompt_embeds=prompt_embeds,
-                num_inference_steps=config.student.num_steps,
+                num_inference_steps=config.student.num_steps, # Use 5-step for eval
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                return_all_latents=True,
+                return_all_latents=False, # Don't need student latents
             )
-            student_images, _, student_latents_all, _ = student_out
+            student_images, _, _, _ = student_out
 
-        student_latents = torch.stack(student_latents_all, dim=1)
-        teacher_latents = torch.stack(teacher_latents_all, dim=1)
-
-        teacher_steps = teacher_pipeline.scheduler.num_inference_steps
-        student_steps = config.student.num_steps
-        aligned_teacher_latents, student_latents_trim, align_indices = align_teacher_student_steps(
-            teacher_latents, student_latents, teacher_steps, student_steps
-        )
-
+        # Log rewards (as in your original code)
         rewards = torch.tensor(reward_fn(student_images, teacher_images, prompts)[0], device=accelerator.device)
         all_rewards.append(rewards.mean().item())
         if rewards.numel() > 1:
@@ -284,70 +369,127 @@ def main(_):
         else:
             all_rewards_std.append(0.0)
 
-        # ----- CD training -----
+        # -----------------------------------------------
+        # ----- CD TRAINING LOOP REWRITE (START) -----
+        # -----------------------------------------------
+        # This is the correct Consistency Distillation training logic.
+        # We replace the `for j in range(student_steps)` loop.
         unet.train()
         total_loss = 0.0
-        for j in range(student_steps):
-            # Detach per-step tensors to prevent reusing freed graphs
-            xtn_plus1 = student_latents_trim[:, j].detach().to(accelerator.device)
-            tn1 = student_pipeline.scheduler.timesteps[j].expand(len(prompts)).to(accelerator.device)
-            prompt_embeds_detached = prompt_embeds.detach()
-
-            with accelerator.autocast():
-                student_out = unet(xtn_plus1, tn1, prompt_embeds_detached).sample
-                pred_x0_student = compute_pred_original_sample(
-                    student_pipeline.scheduler, student_out, tn1, xtn_plus1, detach=False
-                )
-
-            # Teacher backward one-step
-            with torch.no_grad():
-                t_latent = aligned_teacher_latents[:, j].to(accelerator.device)
-                t_timestep = teacher_pipeline.scheduler.timesteps[align_indices[j]].expand(len(prompts)).to(accelerator.device)
-                t_out = teacher_pipeline.unet(t_latent, t_timestep, prompt_embeds_detached).sample
-                x_hat_phi_tn, _ = ddim_step_with_logprob(
-                    teacher_pipeline.scheduler, t_out, t_timestep, t_latent, eta=0.0, prev_sample=None
-                )
-                ema_unet.eval()
-                ema_out = ema_unet(x_hat_phi_tn, tn1, prompt_embeds_detached).sample
-                pred_x0_ema = compute_pred_original_sample(
-                    student_pipeline.scheduler, ema_out, tn1, x_hat_phi_tn, detach=True
-                )
-
-            cd_loss = F.mse_loss(pred_x0_student, pred_x0_ema, reduction="mean")
-
+        
+        # We run `gradient_accumulation_steps` batches per epoch
+        for _ in tqdm(range(config.train.gradient_accumulation_steps), desc="CD Steps"):
             with accelerator.accumulate(unet):
+                # 1. Sample random timesteps t_n+1 and t_n
+                #    We sample from the *full* 1000-step schedule
+                N = len(all_timesteps)
+
+                # Sample indices from [0, N-2]
+                # --- FIX: Create indices on CPU, because all_timesteps is on CPU ---
+                indices = torch.randint(
+                    0, N - 1, (config.sample.batch_size,),
+                    device="cpu"  # Was accelerator.device
+                )
+
+                # t_{n+1} (e.g., timestep 500)
+                # Now we index (cpu tensor by cpu tensor) and move the result to the device
+                t_n_plus_1 = all_timesteps[indices].to(accelerator.device)
+                
+                # t_n (e.g., timestep 499)
+                t_n = all_timesteps[indices + 1].to(accelerator.device)
+
+                # 2. Get x_{t_{n+1}} by noising our ground-truth x0_latents
+                noise = torch.randn_like(x0_latents)
+                xt_n_plus_1 = student_pipeline.scheduler.add_noise(
+                    x0_latents, noise, t_n_plus_1
+                )
+                xt_n_plus_1 = xt_n_plus_1.to(prompt_embeds.dtype)
+
+                # 3. Get Student ("online") prediction of x0
+                with accelerator.autocast():
+                    student_out = unet(xt_n_plus_1, t_n_plus_1, prompt_embeds).sample
+                    pred_x0_student = compute_pred_original_sample(
+                        student_pipeline.scheduler, student_out, t_n_plus_1, xt_n_plus_1, 
+                        detach=False # Keep gradient
+                    )
+
+                # 4. Get Target ("EMA") prediction of x0
+                with torch.no_grad():
+                    # 4a. Get teacher's model_output at t_{n+1}
+                    teacher_model_out = teacher_pipeline.unet(
+                        xt_n_plus_1, t_n_plus_1, prompt_embeds
+                    ).sample
+
+                    # 4b. Perform one DDIM step (t_{n+1} -> t_n) using teacher
+                    #     This is the "distillation" step.
+                    x_t_n = ddim_step_manual(
+                        teacher_pipeline.scheduler,
+                        teacher_model_out,
+                        t_n_plus_1, # current time
+                        t_n,        # previous time
+                        xt_n_plus_1, # current sample
+                        eta=0.0     # Must be deterministic (eta=0)
+                    )
+                    
+                    # 4c. Get EMA model's prediction from x_{t_n} at time t_n
+                    ema_out = ema_unet(x_t_n.to(prompt_embeds.dtype), t_n, prompt_embeds).sample
+                    pred_x0_ema = compute_pred_original_sample(
+                        student_pipeline.scheduler, ema_out, t_n, x_t_n, 
+                        detach=True # No gradient for target
+                    )
+
+                # 5. Calculate CD Loss
+                #    (Using MSE as in your original code, though L1 is also common)
+                cd_loss = F.mse_loss(pred_x0_student, pred_x0_ema, reduction="mean")
+
+                # 6. Backward pass
                 accelerator.backward(cd_loss)
+                
                 if accelerator.sync_gradients:
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        unet.parameters(), config.train.max_grad_norm
+                    )
+                
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                # 7. Update EMA model
                 update_ema(ema_unet, unet, ema_decay)
 
-            total_loss += cd_loss.detach().cpu().item()
+                total_loss += cd_loss.detach().cpu().item()
 
+        # -----------------------------------------------
+        # ----- CD TRAINING LOOP REWRITE (END) -----
+        # -----------------------------------------------
 
-        total_loss /= student_steps
-        all_losses.append(total_loss)
+        avg_loss = total_loss / config.train.gradient_accumulation_steps
+        all_losses.append(avg_loss)
 
         with open(stats_file, "a") as f:
-            f.write(f"Epoch {epoch}: Loss={total_loss:.6f}, Reward={rewards.mean().item():.4f}\n")
+            f.write(f"Epoch {epoch}: Loss={avg_loss:.6f}, Reward={rewards.mean().item():.4f}\n")
 
-        print(f"Epoch {epoch}: CD Loss={total_loss:.6f}, Reward mean={rewards.mean().item():.4f}")
+        print(f"Epoch {epoch}: CD Loss={avg_loss:.6f}, Reward mean={rewards.mean().item():.4f}")
 
         # ----- evaluation -----
+        # This part is unchanged and correctly evaluates the student
+        # using the 5-step sampler.
         if accelerator.is_main_process:
             eval_prompts = [
-                "A cat on a chair",
-                "A boy in a forest",
-                "A futuristic city skyline at night",
-                "A dragon flying over mountains",
-                "A cozy cabin in a snowy forest",
-            ]
+                "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
+                "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
+                "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
+                "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
+                "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
+                "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
+                "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                ]
             with torch.no_grad(), accelerator.autocast():
+                # Teacher (long steps)
                 teacher_eval = [
                     teacher_pipeline(p, num_inference_steps=config.sample.num_steps, guidance_scale=config.sample.guidance_scale).images[0]
                     for p in eval_prompts
                 ]
+                # Student (short steps)
                 student_eval = [
                     student_pipeline(p, num_inference_steps=config.student.num_steps, guidance_scale=config.sample.guidance_scale).images[0]
                     for p in eval_prompts
