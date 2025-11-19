@@ -103,8 +103,8 @@ If you use ReDiF in your research, please cite:
 
 ```
 @article{ReDiF2025,
-  title   = {ReDiF: RL-based Distillation of Diffusion Models},
-  author  = {Tighkhorshid, A. and ...},
+  title   = {ReDiF: Reinforced Distillation for Few step diffusion},
+  author  = {...},
   year    = {2025},
   journal = {...}
 }
