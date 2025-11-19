@@ -110,8 +110,6 @@ If you use ReDiF in your research, please cite:
 }
 ```
 
-(Replace with final venue details.)
-
 ---
 
 ## 🤝 Why ReDiF?
