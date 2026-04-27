@@ -197,6 +197,8 @@ def main(_):
     else:
         outdir = outdir + "_ddpo_prompts"
 
+    outdir = outdir + "after_war"
+
     stats_dir = outdir
     os.makedirs(stats_dir, exist_ok=True)
     stats_file = os.path.join(stats_dir, "training_stats.txt")
@@ -295,6 +297,13 @@ def main(_):
     )
 
     unet, optimizer = accelerator.prepare(unet, optimizer)
+
+    lora_params = 0
+    for name, module in student_pipeline.unet.attn_processors.items():
+        for p in module.parameters():
+            lora_params += p.numel()
+
+    print("LoRA parameters:", lora_params)
 
     # Default prompt function
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)

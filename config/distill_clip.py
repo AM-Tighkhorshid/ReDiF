@@ -8,7 +8,7 @@ def get_config():
     config.run_name = ""
     config.seed = 44
     config.logdir = "logs"
-    config.num_epochs = 30
+    config.num_epochs = 20
     config.save_freq = 20
     config.num_checkpoint_limit = 5
     config.mixed_precision = "no"
@@ -110,6 +110,7 @@ def get_config():
     # Number of sampling steps per stage of progressive distillation
     # (the paper uses this halving schedule)
     config.distill.steps_list = [25, 12, 5]
+    config.distill.epochs_per_stage = 7
 
     # Number of gradient updates (iterations) for each distillation stage
     # You can increase to 50000+ for high-quality results;
