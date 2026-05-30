@@ -22,10 +22,10 @@ parser.add_argument("--coco_root", default="coco_dataset", help="Root folder of 
 parser.add_argument("--laion_root", default="laion_dataset", help="Root folder of LAION dataset")
 parser.add_argument("--num_images", type=int, default=5000, help="Number of images to evaluate")
 parser.add_argument("--teacher_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/output/distill_clip/teacher_model", help="Teacher model directory")
-parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/Progressive_ppo_Distill/final_student", help="Student model directory")
+parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/PPO_clip_dino_coco_prompts/student_model", help="Student model directory")
 parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
 parser.add_argument("--student_steps", type=int, default=5, help="Student diffusion steps")
-parser.add_argument("--batch_size", type=int, default=32, help="Batch size for metrics calculation") # بچ سایز اضافه شد
+parser.add_argument("--batch_size", type=int, default=32, help="Batch size for metrics calculation") # batch size is added
 
 args = parser.parse_args()
 
@@ -144,8 +144,8 @@ clip_transform = T.Compose([
 ])
 
 # loading CLIP model one for all usages
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE).eval()
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True).to(DEVICE).eval()
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True)
 
 @torch.inference_mode()
 def extract_clip_features_batched(image_paths, batch_size=args.batch_size):
@@ -245,7 +245,7 @@ def evaluate_model(model_name, gen_folder, prompts, gt_paths, real_img_feats, te
     prdc_metrics = compute_prdc(real_img_feats, fake_img_feats)
     results.update(prdc_metrics)
 
-    print(f"\nResults for {model_name}:")
+    print(f"\nResults for {model_name} ({gen_folder.split('/')[-3]}):")
     for k, v in results.items():
         print(f"  {k}: {v:.6f}")
 
