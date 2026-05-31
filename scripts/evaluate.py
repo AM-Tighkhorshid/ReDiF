@@ -22,7 +22,7 @@ parser.add_argument("--coco_root", default="coco_dataset", help="Root folder of 
 parser.add_argument("--laion_root", default="laion_dataset", help="Root folder of LAION dataset")
 parser.add_argument("--num_images", type=int, default=5000, help="Number of images to evaluate")
 parser.add_argument("--teacher_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/output/distill_clip/teacher_model", help="Teacher model directory")
-parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/PPO_clip_dino_coco_prompts/student_model", help="Student model directory")
+parser.add_argument("--student_model", default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/ddpo-pytorch-main/ddpo-pytorch-main/PPO_clip_kl0.5_coco_____second_try/student_model", help="Student model directory")
 parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
 parser.add_argument("--student_steps", type=int, default=5, help="Student diffusion steps")
 parser.add_argument("--batch_size", type=int, default=32, help="Batch size for metrics calculation") # batch size is added

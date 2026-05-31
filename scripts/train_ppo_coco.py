@@ -1,318 +1,280 @@
-from collections import defaultdict
-import contextlib
+"""
+Teacher (50-step DDIM) → Student (5-step DDIM) distillation via PPO.
+
+Reward   : composite reward from rewards.py
+           (clip | dino | perception | text_image | aesthetic, or any combo)
+KL reg   : analytic KL on final latent  N(μ_student, I) || N(μ_teacher, I)
+           = ½ ||μ_s − μ_t||²   (no step-alignment needed)
+
+PPO loop : old log-probs stored during no-grad rollout;
+           new log-probs recomputed per gradient step  → correct importance ratio
+"""
+
 import os
 import datetime
-from concurrent import futures
-import time
-from absl import app, flags
-from ml_collections import config_flags
 import json
 import random
+
+from absl import app, flags
+from ml_collections import config_flags
+
 from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
-from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel
+
+from diffusers import StableDiffusionPipeline, DDIMScheduler
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
+
 import numpy as np
-import ddpo_pytorch.prompts
-from ddpo_pytorch.rewards import get_reward_fn
-from ddpo_pytorch.stat_tracking import PerPromptStatTracker
-from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
-from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
 import torch
-import wandb
+import torch.nn.functional as F
 from functools import partial
 import tqdm
-import tempfile
-from PIL import Image
-import cv2
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from PIL import Image
 
-
-def save_side_by_side(student_images, teacher_images, epoch, outdir):
-    os.makedirs(outdir, exist_ok=True)
-    student_dir = os.path.join(outdir, "student_only")
-    combined_dir = os.path.join(outdir, "side_by_side")
-
-    os.makedirs(student_dir, exist_ok=True)
-    os.makedirs(combined_dir, exist_ok=True)
-
-    for idx in range(min(len(student_images), len(teacher_images))):
-        s_img = student_images[idx].convert("RGB")
-        t_img = teacher_images[idx].convert("RGB")
-
-        # Resize both to the same square size
-        h = min(s_img.height, t_img.height)
-        s_img = s_img.resize((h, h), Image.Resampling.LANCZOS)
-        t_img = t_img.resize((h, h), Image.Resampling.LANCZOS)
-
-        # Save student-only image
-        student_path = os.path.join(student_dir, f"epoch{epoch}_student{idx}.png")
-        s_img.save(student_path)
-        print(f"Saved student image: {student_path}")
-
-        # Create side-by-side combined image
-        combined = Image.new("RGB", (t_img.width + s_img.width, h))
-        combined.paste(t_img, (0, 0))
-        combined.paste(s_img, (t_img.width, 0))
-
-        combined_path = os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png")
-        combined.save(combined_path)
-        print(f"Saved side-by-side image: {combined_path}")
-
-def js_divergence(p, q):
-    p = F.softmax(p, dim=-1)
-    q = F.softmax(q, dim=-1)
-    m = 0.5 * (p + q)
-    js = 0.5 * (F.kl_div(p.log(), m, reduction="batchmean", log_target=False) +
-                F.kl_div(q.log(), m, reduction="batchmean", log_target=False))
-    return js
-
-def chi2_divergence(p, q):
-    p = F.softmax(p, dim=-1)
-    q = F.softmax(q, dim=-1)
-    div = torch.mean(torch.sum(((p - q) ** 2) / (q + 1e-8), dim=-1))
-    return div
-
-def power_divergence(p, q, power=1.2):
-    p = F.softmax(p, dim=-1)
-    q = F.softmax(q, dim=-1)
-    div = torch.mean(torch.sum((p ** power * q ** (1 - power) - 1) / (power * (power - 1)), dim=-1))
-    return div
-
-def renyi_divergence(p, q, alpha=0.8):
-    p = F.softmax(p, dim=-1)
-    q = F.softmax(q, dim=-1)
-    div = (1.0 / (alpha - 1.0)) * torch.log(torch.sum(p ** alpha * q ** (1 - alpha), dim=-1) + 1e-8)
-    return torch.mean(div)
-
-def kl_divergence(p, q):
-    p = p.float().view(p.shape[0], -1)
-    q = q.float().view(q.shape[0], -1)
-    p = F.log_softmax(p, dim=-1)
-    q = F.softmax(q, dim=-1)
-    kl = F.kl_div(p, q, reduction='batchmean', log_target=False)
-    return kl
-
-def weighted_kl_divergence(p, q, weights=None):
-    """
-    Weighted KL divergence between distributions p and q.
-
-    Args:
-        p (torch.Tensor): Student logit tensor of shape [batch_size, num_steps, dim] or [batch_size, dim].
-        q (torch.Tensor): Teacher logit tensor of shape [batch_size, num_steps, dim] or [batch_size, dim].
-        weights (torch.Tensor, optional): Step-wise weights of shape [num_steps]. Should sum to 1.
-
-    Returns:
-        torch.Tensor: Weighted KL divergence (scalar).
-    """
-    p = p.float()
-    q = q.float()
-
-    # If input is 2D (no timesteps), add a timestep dimension
-    if p.dim() == 2:
-        p = p.unsqueeze(1)
-        q = q.unsqueeze(1)
-
-    batch_size, num_steps, dim = p.shape
-
-    # Convert logits to probabilities
-    p_log = F.softmax(p, dim=-1)
-    q_prob = F.softmax(q, dim=-1)
-
-    # Compute KL divergence per step (no reduction over timesteps yet)
-    # Result shape: [batch_size, num_steps]
-    kl_per_step = F.kl_div(p_log, q_prob, reduction='none', log_target=False).sum(dim=-1)
-
-    # Average over batch dimension -> [num_steps]
-    kl_per_step = kl_per_step.mean(dim=0)
-
-    # Weighted mean over steps if weights are provided
-    if weights is not None:
-        weights = weights.to(p.device)
-        weights = weights / weights.sum()  # normalize to sum to 1
-        kl_total = torch.sum(kl_per_step * weights)
-    else:
-        kl_total = kl_per_step.mean()
-
-    return kl_total
+import ddpo_pytorch.prompts
+# rewards.py must be on the Python path (e.g. same directory or installed package)
+from ddpo_pytorch.rewards import get_reward_fn
+from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
+from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
 FLAGS = flags.FLAGS
-config_flags.DEFINE_config_file("config", "config/distill_clip.py", "Training configuration.")
-
-# --- New flags for prompt source / COCO ---
+config_flags.DEFINE_config_file(
+    "config", "config/distill_clip.py", "Training configuration."
+)
 flags.DEFINE_enum(
     "prompt_source", "coco", ["default", "coco"],
-    "Source of prompts to use: 'default' uses built-in prompt function; 'coco' samples captions from COCO annotations."
+    "Prompt source: 'default' = built-in fn, 'coco' = COCO captions.",
 )
 flags.DEFINE_enum(
     "coco_split", "train", ["train", "val", "both"],
-    "Which COCO captions split to use when prompt_source=coco."
+    "COCO split to use when prompt_source=coco.",
 )
 flags.DEFINE_string(
     "coco_annotations_dir", "coco_dataset/annotations",
-    "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
+    "Path to COCO annotations directory.",
 )
-flags.DEFINE_enum(
-    "divergence_type",
-    default="kl",
-    enum_values=["kl", "js", "chi2", "power", "renyi"],
-    help="Divergence function to use for PPO regularization."
-)
-
 flags.DEFINE_float(
-    "divergence_param",
-    default=0.2,
-    help="Extra parameter (p or α) for power or Rényi divergences."
+    "kl_lambda", 0.5,
+    "Weight λ for the latent KL regularisation term in the total loss.",
+)
+flags.DEFINE_list(
+    "reward_types", ["clip"],
+    "Comma-separated reward(s): clip, dino, perception, text_image, aesthetic. "
+    "Example: --reward_types=clip,dino",
 )
 
 logger = get_logger(__name__)
 
-def align_teacher_student_steps(teacher_latents, student_latents, teacher_steps, student_steps):
-    if isinstance(teacher_latents, list):
-        teacher_latents = torch.stack(teacher_latents, dim=1)
-    align_indices = torch.linspace(teacher_steps//student_steps, teacher_steps, steps=student_steps).long()
-    aligned_teacher_latents = teacher_latents[:, align_indices]
-    return aligned_teacher_latents, student_latents[:,1:]
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def save_side_by_side(student_images, teacher_images, epoch, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    student_dir  = os.path.join(outdir, "student_only")
+    combined_dir = os.path.join(outdir, "side_by_side")
+    os.makedirs(student_dir,  exist_ok=True)
+    os.makedirs(combined_dir, exist_ok=True)
+
+    for idx in range(min(len(student_images), len(teacher_images))):
+        s = student_images[idx].convert("RGB")
+        t = teacher_images[idx].convert("RGB")
+        h = min(s.height, t.height)
+        s = s.resize((h, h), Image.Resampling.LANCZOS)
+        t = t.resize((h, h), Image.Resampling.LANCZOS)
+
+        s.save(os.path.join(student_dir,  f"epoch{epoch}_student{idx}.png"))
+
+        combined = Image.new("RGB", (t.width + s.width, h))
+        combined.paste(t, (0, 0))
+        combined.paste(s, (t.width, 0))
+        combined.save(os.path.join(combined_dir, f"epoch{epoch}_sample{idx}.png"))
+
+
+def rewards_to_tensor(rewards_raw, device) -> torch.Tensor:
+    """Convert list[float] or np.ndarray reward output to a (B,) float32 tensor."""
+    if isinstance(rewards_raw, torch.Tensor):
+        return rewards_raw.to(device=device, dtype=torch.float32)
+    return torch.tensor(np.array(rewards_raw, dtype=np.float32), device=device)
+
+
+def latent_kl(student_latent: torch.Tensor,
+              teacher_latent: torch.Tensor) -> torch.Tensor:
+    """
+    Analytic KL(N(μ_s, I) || N(μ_t, I)) = ½ ||μ_s − μ_t||²  averaged over batch.
+    Both tensors: (B, C, H, W).
+    """
+    s = student_latent.float().view(student_latent.shape[0], -1)  # (B, D)
+    t = teacher_latent.float().view(teacher_latent.shape[0], -1)  # (B, D)
+    return 0.5 * ((s - t) ** 2).sum(dim=-1).mean()               # scalar
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main(_):
-    config = FLAGS.config
+    config       = FLAGS.config
+    reward_types = list(FLAGS.reward_types)   # e.g. ["clip"] or ["clip","dino"]
 
-    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    config.run_name = config.run_name or unique_id
-    config.run_name += f"_distill_{unique_id}"
+    unique_id        = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    config.run_name  = (config.run_name or unique_id) + f"_distill_{unique_id}"
 
-    div_type = FLAGS.divergence_type.lower()
-    reward_types = ["clip"]
-    outdir = "PPO_" + "_".join(reward_types)
-    kl_lambda = getattr(config.train, "kl_lambda", 1.0)
-    if kl_lambda != 0:
-        outdir = outdir + "_" + div_type + "_" + str(kl_lambda)
-    if FLAGS.prompt_source == "coco":
-        outdir = outdir + "_coco_prompts_weighted_kl_decreasing"
-    else:
-        outdir = outdir + "_ddpo_prompts"
+    reward_tag = "_".join(reward_types)
+    outdir  = f"PPO_{reward_tag}_kl{FLAGS.kl_lambda}"
+    outdir += "_coco" if FLAGS.prompt_source == "coco" else "_ddpo"
 
-    outdir = outdir + "after_war"
+    outdir = outdir + "_____second_try"
 
-    stats_dir = outdir
+    stats_dir  = outdir
     os.makedirs(stats_dir, exist_ok=True)
     stats_file = os.path.join(stats_dir, "training_stats.txt")
 
-    all_losses = []
-    all_rewards = []
-    all_rewards_std = []
+    all_losses, all_rewards, all_rewards_std = [], [], []
 
-    accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.logdir, config.run_name),
-        total_limit=config.num_checkpoint_limit,
-    )
+    # ------------------------------------------------------------------ #
+    # Accelerator
+    # ------------------------------------------------------------------ #
     accelerator = Accelerator(
         log_with="wandb",
         mixed_precision=config.mixed_precision,
-        project_config=accelerator_config,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * config.student.num_steps,
+        project_config=ProjectConfiguration(
+            project_dir=os.path.join(config.logdir, config.run_name),
+            total_limit=config.num_checkpoint_limit,
+        ),
+        # Accumulate over ALL student steps in one virtual batch
+        gradient_accumulation_steps=(
+            config.train.gradient_accumulation_steps * config.student.num_steps
+        ),
     )
-
     set_seed(config.seed, device_specific=True)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("ddpo-distill", config=config.to_dict())
+        accelerator.init_trackers(
+            "ddpo-distill",
+            config={**config.to_dict(), "reward_types": reward_types,
+                    "kl_lambda": FLAGS.kl_lambda},
+        )
 
     logger.info(f"\n{config}")
+    logger.info(f"Reward types : {reward_types}")
+    logger.info(f"KL λ         : {FLAGS.kl_lambda}")
 
+    # ------------------------------------------------------------------ #
+    # Teacher pipeline  (all frozen)
+    # ------------------------------------------------------------------ #
     teacher_pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained.model, revision=config.pretrained.revision
     )
-    teacher_pipeline.scheduler = DDIMScheduler.from_config(teacher_pipeline.scheduler.config)
+    teacher_pipeline.scheduler = DDIMScheduler.from_config(
+        teacher_pipeline.scheduler.config
+    )
     teacher_pipeline.safety_checker = None
-    teacher_pipeline.set_progress_bar_config(disable=False)
-    teacher_pipeline.vae.to(accelerator.device)
-    teacher_pipeline.text_encoder.to(accelerator.device)
-    teacher_pipeline.unet.to(accelerator.device)
-    teacher_pipeline.text_encoder.requires_grad_(False)
+    teacher_pipeline.set_progress_bar_config(disable=True)
+    teacher_pipeline.to(accelerator.device)
     teacher_pipeline.vae.requires_grad_(False)
+    teacher_pipeline.text_encoder.requires_grad_(False)
     teacher_pipeline.unet.requires_grad_(False)
     teacher_pipeline.save_pretrained(config.teacher_output_dir)
 
+    # ------------------------------------------------------------------ #
+    # Student pipeline  (UNet or LoRA trainable)
+    # ------------------------------------------------------------------ #
     student_pipeline = StableDiffusionPipeline.from_pretrained(
         config.student.model, revision=config.student.revision
     )
-    student_pipeline.scheduler = DDIMScheduler.from_config(student_pipeline.scheduler.config)
+    student_pipeline.scheduler = DDIMScheduler.from_config(
+        student_pipeline.scheduler.config
+    )
     student_pipeline.safety_checker = None
-    student_pipeline.set_progress_bar_config(disable=False)
-    student_pipeline.vae.to(accelerator.device)
-    student_pipeline.text_encoder.to(accelerator.device)
-    student_pipeline.unet.to(accelerator.device)
+    student_pipeline.set_progress_bar_config(disable=True)
+    student_pipeline.to(accelerator.device)
     student_pipeline.vae.requires_grad_(False)
     student_pipeline.text_encoder.requires_grad_(False)
-    student_pipeline.unet.requires_grad_(not config.use_lora)
 
     if config.use_lora:
         lora_attn_procs = {}
         for name in student_pipeline.unet.attn_processors.keys():
             cross_attention_dim = (
-                None if name.endswith("attn1.processor") else student_pipeline.unet.config.cross_attention_dim
+                None
+                if name.endswith("attn1.processor")
+                else student_pipeline.unet.config.cross_attention_dim
             )
             if name.startswith("mid_block"):
                 hidden_size = student_pipeline.unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(student_pipeline.unet.config.block_out_channels))[block_id]
+                block_id    = int(name[len("up_blocks."):len("up_blocks.") + 1])
+                hidden_size = list(
+                    reversed(student_pipeline.unet.config.block_out_channels)
+                )[block_id]
             elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
+                block_id    = int(name[len("down_blocks."):len("down_blocks.") + 1])
                 hidden_size = student_pipeline.unet.config.block_out_channels[block_id]
-            lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+            )
         student_pipeline.unet.set_attn_processor(lora_attn_procs)
 
         class _Wrapper(AttnProcsLayers):
             def forward(self, *args, **kwargs):
                 return student_pipeline.unet(*args, **kwargs)
+
         unet = _Wrapper(student_pipeline.unet.attn_processors)
     else:
+        student_pipeline.unet.requires_grad_(True)
         unet = student_pipeline.unet
 
-    dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        dtype = torch.bfloat16
-
+    # Cast frozen parts to training dtype
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(
+        accelerator.mixed_precision, torch.float32
+    )
     student_pipeline.vae.to(accelerator.device, dtype=dtype)
     student_pipeline.text_encoder.to(accelerator.device, dtype=dtype)
     if config.use_lora:
         student_pipeline.unet.to(accelerator.device, dtype=dtype)
 
-    optimizer_cls = torch.optim.AdamW
-    optimizer = optimizer_cls(
+    optimizer = torch.optim.AdamW(
         unet.parameters(),
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
-
     unet, optimizer = accelerator.prepare(unet, optimizer)
 
-    lora_params = 0
-    for name, module in student_pipeline.unet.attn_processors.items():
-        for p in module.parameters():
-            lora_params += p.numel()
+    lora_params = sum(
+        p.numel()
+        for m in student_pipeline.unet.attn_processors.values()
+        for p in m.parameters()
+    )
+    logger.info(f"LoRA parameters: {lora_params:,}")
 
-    print("LoRA parameters:", lora_params)
+    # ------------------------------------------------------------------ #
+    # Reward function  (built from rewards.py)
+    # ------------------------------------------------------------------ #
+    # composite_reward_fn(student_images, teacher_images, prompts)
+    #   → (total: list[float],  details: dict[str, list[float]])
+    reward_fn = get_reward_fn(reward_types, teacher_pipeline, student_pipeline)
 
-    # Default prompt function
+    # ------------------------------------------------------------------ #
+    # Prompts
+    # ------------------------------------------------------------------ #
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
 
-    # --- Load COCO captions if selected ---
     coco_captions = None
     if FLAGS.prompt_source == "coco":
-        ann_dir = FLAGS.coco_annotations_dir
         candidates = []
+        ann_dir = FLAGS.coco_annotations_dir
         if FLAGS.coco_split in ("train", "both"):
             candidates.append(os.path.join(ann_dir, "captions_train2017.json"))
         if FLAGS.coco_split in ("val", "both"):
@@ -320,47 +282,43 @@ def main(_):
 
         coco_captions = []
         for cpath in candidates:
-            if not os.path.isabs(cpath):
-                cpath = os.path.abspath(cpath)
+            cpath = os.path.abspath(cpath)
             if not os.path.exists(cpath):
-                print(f"COCO caption file not found: {cpath}")
+                logger.warning(f"COCO file not found: {cpath}")
                 continue
-            try:
-                with open(cpath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                anns = data.get("annotations", [])
-                for a in anns:
-                    cap = a.get("caption")
-                    if cap and isinstance(cap, str):
-                        coco_captions.append(cap)
-                print(f"Loaded {len(anns)} annotations from {cpath}")
-            except Exception as e:
-                print(f"Failed to load COCO captions from {cpath}: {e}")
+            with open(cpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for a in data.get("annotations", []):
+                cap = a.get("caption")
+                if cap and isinstance(cap, str):
+                    coco_captions.append(cap)
+            logger.info(f"Loaded {len(data['annotations'])} captions from {cpath}")
 
-        if len(coco_captions) == 0:
-            print("Warning: --prompt_source=coco selected but no captions were loaded. Falling back to default prompts.")
+        if not coco_captions:
+            logger.warning("No COCO captions loaded — falling back to default prompts.")
             coco_captions = None
 
-    # Reward function
-    reward_fn = get_reward_fn(reward_types, teacher_pipeline, student_pipeline)
-
+    # ================================================================== #
+    # Training loop
+    # ================================================================== #
     for epoch in range(config.num_epochs):
-        logger.info(f"Epoch {epoch}: Sampling and Training")
+        logger.info(f"Epoch {epoch}: Sampling + Training")
 
-        # --- Pick prompts ---
-        if FLAGS.prompt_source == "coco" and coco_captions is not None:
+        # ---- Prompt batch ------------------------------------------------
+        if FLAGS.prompt_source == "coco" and coco_captions:
             if len(coco_captions) >= config.sample.batch_size:
                 prompts = random.sample(coco_captions, k=config.sample.batch_size)
             else:
-                prompts = [random.choice(coco_captions) for _ in range(config.sample.batch_size)]
-            prompt_pairs = [(p, None) for p in prompts]
-            prompt_metadata = [None] * len(prompts)
+                prompts = [
+                    random.choice(coco_captions)
+                    for _ in range(config.sample.batch_size)
+                ]
         else:
-            prompt_pairs = [prompt_fn(**config.prompt_fn_kwargs) for _ in range(config.sample.batch_size)]
-            prompts = [p[0] for p in prompt_pairs]
-            prompt_metadata = [p[1] for p in prompt_pairs]
+            pairs   = [prompt_fn(**config.prompt_fn_kwargs)
+                       for _ in range(config.sample.batch_size)]
+            prompts = [p[0] for p in pairs]
 
-        # --- Encode prompts ---
+        # ---- Encode prompts ----------------------------------------------
         prompt_ids = student_pipeline.tokenizer(
             prompts,
             return_tensors="pt",
@@ -368,183 +326,235 @@ def main(_):
             truncation=True,
             max_length=student_pipeline.tokenizer.model_max_length,
         ).input_ids.to(accelerator.device)
-        prompt_embeds = student_pipeline.text_encoder(prompt_ids)[0]
 
         with torch.no_grad():
-            teacher_out = pipeline_with_logprob(
-                teacher_pipeline,
-                prompt_embeds=prompt_embeds,
-                num_inference_steps=config.sample.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                eta=config.sample.eta,
-                output_type="pt",
-                return_all_latents=True,
-            )
-            teacher_images, _, teacher_latents_all, teacher_log_probs_all = teacher_out
+            prompt_embeds = student_pipeline.text_encoder(prompt_ids)[0]  # (B, L, D)
 
-        student_pipeline.unet.eval()
-        with accelerator.autocast():
-            student_out = pipeline_with_logprob(
-                student_pipeline,
-                prompt_embeds=prompt_embeds,
-                num_inference_steps=config.student.num_steps,
-                guidance_scale=config.sample.guidance_scale,
-                eta=config.sample.eta,
-                output_type="pt",
-                return_all_latents=True,
-            )
-            student_images, _, student_latents_all, student_log_probs_all = student_out
-            log_probs = student_log_probs_all[-1]
+        # ---------------------------------------------------------------- #
+        # Rollout  (no gradients)
+        # ---------------------------------------------------------------- #
+        with torch.no_grad():
 
-        latents = torch.stack(student_latents_all, dim=1)
-        timesteps = student_pipeline.scheduler.timesteps.repeat(config.sample.batch_size, 1)
+            # --- Teacher: 50 DDIM steps ----------------------------------
+            with accelerator.autocast():
+                teacher_images, _, teacher_latents_all, _ = pipeline_with_logprob(
+                    teacher_pipeline,
+                    prompt_embeds=prompt_embeds,
+                    num_inference_steps=config.sample.num_steps,   # 50
+                    guidance_scale=config.sample.guidance_scale,
+                    eta=config.sample.eta,
+                    output_type="pt",
+                    return_all_latents=True,
+                )
+            # teacher_latents_all: list[Tensor(B,C,h,w)], length = 51
+            teacher_final_latent = teacher_latents_all[-1]   # (B, C, h, w)
 
-        rewards = torch.tensor(
-            reward_fn(student_images, teacher_images, prompts)[0], device=accelerator.device
+            # --- Student: 5 DDIM steps  (OLD policy) ---------------------
+            student_pipeline.unet.eval()
+            with accelerator.autocast():
+                student_images, _, student_latents_all, student_log_probs_all = \
+                    pipeline_with_logprob(
+                        student_pipeline,
+                        prompt_embeds=prompt_embeds,
+                        num_inference_steps=config.student.num_steps,  # 5
+                        guidance_scale=config.sample.guidance_scale,
+                        eta=config.sample.eta,
+                        output_type="pt",
+                        return_all_latents=True,
+                    )
+            # student_latents_all   : list[Tensor(B,C,h,w)], length = 6
+            # student_log_probs_all : list[Tensor(B,)],      length = 5
+
+            # Stack for gradient phase
+            latents      = torch.stack(student_latents_all, dim=1)       # (B, T+1, C, h, w)
+            old_log_probs = torch.stack(student_log_probs_all, dim=1)    # (B, T)
+
+            student_final_latent = student_latents_all[-1]               # (B, C, h, w)
+
+        # (B, T) timestep schedule for student
+        timesteps = student_pipeline.scheduler.timesteps.repeat(
+            config.sample.batch_size, 1
         )
 
+        # ---------------------------------------------------------------- #
+        # Reward  — calls composite_reward_fn from rewards.py
+        # teacher_images and student_images are (B,C,H,W) tensors in [0,1]
+        # ---------------------------------------------------------------- #
+        with torch.no_grad():
+            rewards_raw, reward_details = reward_fn(
+                student_images, teacher_images, prompts
+            )
+
+        rewards = rewards_to_tensor(rewards_raw, accelerator.device)  # (B,)
+
+        # Normalised, clamped advantages
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        advantages = torch.clamp(
+            advantages,
+            -config.train.adv_clip_max,
+             config.train.adv_clip_max,
+        )  # (B,)
 
-        aligned_teacher_log_probs = torch.stack(teacher_log_probs_all, dim=1)
-        aligned_student_log_probs = torch.stack(student_log_probs_all, dim=1)
+        # ---------------------------------------------------------------- #
+        # Latent KL regularisation
+        # ---------------------------------------------------------------- #
+        kl_reg = latent_kl(student_final_latent, teacher_final_latent)  # scalar
 
-        if aligned_teacher_log_probs.shape[1] != aligned_student_log_probs.shape[1]:
-            aligned_teacher_log_probs = torch.nn.functional.interpolate(
-                aligned_teacher_log_probs.unsqueeze(1),
-                size=aligned_student_log_probs.shape[1],
-                mode="linear",
-                align_corners=True,
-            ).squeeze(1)
-
-
-        div_type = FLAGS.divergence_type.lower()
-        if div_type == "kl":
-            kl_loss_total = kl_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
-        elif div_type == "js":
-            kl_loss_total = js_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
-        elif div_type == "chi2":
-            kl_loss_total = chi2_divergence(aligned_student_log_probs, aligned_teacher_log_probs)
-        elif div_type == "power":
-            kl_loss_total = power_divergence(aligned_student_log_probs, aligned_teacher_log_probs, FLAGS.divergence_param)
-        elif div_type == "renyi":
-            kl_loss_total = renyi_divergence(aligned_student_log_probs, aligned_teacher_log_probs, FLAGS.divergence_param)
-        else:
-            raise ValueError(f"Unknown divergence type: {div_type}")
-
-        # kl_loss_total = torch.nn.functional.kl_div(
-        #     aligned_student_log_probs,
-        #     aligned_teacher_log_probs,
-        #     reduction="batchmean",
-        #     log_target=True
-        # )
-
-        avg_kl_per_step = kl_loss_total / config.student.num_steps
-
-        # weighted KL
-        # weights = torch.linspace(0.1, 1.0, config.student.num_steps, device=accelerator.device)
-        # kl_loss_total = weighted_kl_divergence(aligned_student_log_probs, aligned_teacher_log_probs, weights=weights)
-        # avg_kl_per_step = kl_loss_total
-
+        # ---------------------------------------------------------------- #
+        # PPO gradient steps over student denoising steps
+        # ---------------------------------------------------------------- #
         student_pipeline.unet.train()
+        total_loss = torch.tensor(0.0, device=accelerator.device)
+
         for j in range(config.student.num_steps):
             with accelerator.accumulate(unet):
                 with accelerator.autocast():
-                    noise_pred = unet(latents[:, j], timesteps[:, j], prompt_embeds).sample
-                    _, log_prob = ddim_step_with_logprob(
+                    noise_pred = unet(
+                        latents[:, j],
+                        timesteps[:, j],
+                        prompt_embeds,
+                    ).sample   # (B, C, h, w)
+
+                    # New log-prob under current (updated) policy
+                    _, new_log_prob = ddim_step_with_logprob(
                         student_pipeline.scheduler,
                         noise_pred,
                         timesteps[:, j],
                         latents[:, j],
                         eta=config.sample.eta,
-                        prev_sample=latents[:, j+1] if j + 1 < latents.shape[1] else latents[:, j],
+                        prev_sample=(
+                            latents[:, j + 1]
+                            if j + 1 < latents.shape[1]
+                            else latents[:, j]
+                        ),
                     )
-                adv = torch.clamp(advantages, -config.train.adv_clip_max, config.train.adv_clip_max)
-                print(advantages)
-                ratio = torch.exp(log_prob - aligned_student_log_probs[:, j])
-                unclipped = -adv * ratio
-                print(ratio)
-                clipped = -adv * torch.clamp(ratio, 1.0 - config.train.clip_range, 1.0 + config.train.clip_range)
-                loss = torch.mean(torch.maximum(unclipped, clipped))
+                    # new_log_prob : (B,)
 
-                total_loss = loss + getattr(config.train, "kl_lambda", 1.0) *  avg_kl_per_step
+                # Importance ratio  π_new / π_old
+                ratio  = torch.exp(new_log_prob - old_log_probs[:, j])   # (B,)
 
-                accelerator.backward(total_loss)
+                # PPO clipped surrogate  (we MINIMISE, so negate the reward)
+                surr1  = -advantages * ratio
+                surr2  = -advantages * torch.clamp(
+                    ratio,
+                    1.0 - config.train.clip_range,
+                    1.0 + config.train.clip_range,
+                )
+                policy_loss = torch.mean(torch.maximum(surr1, surr2))
+
+                step_loss   = policy_loss + FLAGS.kl_lambda * kl_reg
+                total_loss  = total_loss + step_loss
+
+                accelerator.backward(step_loss)
                 if accelerator.sync_gradients:
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.train.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        unet.parameters(), config.train.max_grad_norm
+                    )
                 optimizer.step()
                 optimizer.zero_grad()
 
-        total_loss_val = total_loss.item() if 'total_loss' in locals() else 0.0
+        # ---------------------------------------------------------------- #
+        # Logging
+        # ---------------------------------------------------------------- #
+        total_loss_val = total_loss.item()
+        reward_mean    = rewards.mean().item()
+        reward_std     = rewards.std().item()
+
         all_losses.append(total_loss_val)
-        all_rewards.append(rewards.mean().item())
-        all_rewards_std.append(rewards.std().item())
+        all_rewards.append(reward_mean)
+        all_rewards_std.append(reward_std)
+
+        detail_str = "  ".join(
+            f"{k}={float(np.mean(v)):.4f}" for k, v in reward_details.items()
+        )
+        print(
+            f"Epoch {epoch:4d} | reward {reward_mean:+.4f} ± {reward_std:.4f} "
+            f"| kl {kl_reg.item():.4f} | loss {total_loss_val:.6f}"
+            + (f"  [{detail_str}]" if detail_str else "")
+        )
 
         with open(stats_file, "a") as f:
-            f.write(f"Epoch {epoch}: Loss={total_loss_val:.6f}, Reward_mean={rewards.mean().item():.6f}, Reward_std={rewards.std().item():.6f}\n")
-
-        print(f"Epoch {epoch}: Reward mean = {rewards.mean().item():.4f}, Reward std = {rewards.std().item():.4f}")
+            f.write(
+                f"Epoch {epoch}: loss={total_loss_val:.6f}, "
+                f"reward={reward_mean:.6f}±{reward_std:.6f}, "
+                f"kl={kl_reg.item():.6f}"
+            )
+            for k, v in reward_details.items():
+                f.write(f", {k}={float(np.mean(v)):.6f}")
+            f.write("\n")
 
         if accelerator.is_main_process:
+            log_dict = {
+                "reward_mean": reward_mean,
+                "reward_std":  reward_std,
+                "kl_latent":   kl_reg.item(),
+                "loss":        total_loss_val,
+            }
+            for k, v in reward_details.items():
+                log_dict[f"reward/{k}"] = float(np.mean(v))
+            accelerator.log(log_dict, step=epoch)
+
+        # ---------------------------------------------------------------- #
+        # Visualisation
+        # ---------------------------------------------------------------- #
+        if accelerator.is_main_process:
             eval_prompts = [
-                "A crystal-clear glass bowl overflowing with ripe, vibrant oranges on a rustic wooden table, sunlight streaming through a nearby window, warm golden reflections and soft shadows",
-                "A fluffy tabby cat caught mid-step, looking directly at the camera with curious eyes, sunlight highlighting its fur, cozy home interior in soft focus behind it",
-                "A sprawling futuristic city skyline at night, glowing neon lights reflecting off glass skyscrapers, flying cars streaking through the sky, a misty cyberpunk atmosphere in vivid blues and pinks",
-                "A U.S. Marine in desert camouflage standing under a setting sun, gazing at his smartphone with a thoughtful expression, soft golden light and dust in the air",
-                "A warm, glowing log cabin nestled in a snowy pine forest at twilight, smoke rising gently from the chimney, soft snowflakes falling under a purple and orange winter sky",
-                "A sleek motorcycle parked beside a rain puddle reflecting a nearby vintage van, wet asphalt glistening under streetlights, dramatic evening sky with lingering clouds",
-                "A colorful plain under a bright sky, filled with wildflowers of red, yellow, and purple, rolling green hills stretching to the horizon, soft sunlight and a gentle breeze – یک دشت کالرفول"
+                "A crystal-clear glass bowl overflowing with ripe oranges on a rustic wooden table",
+                "A fluffy tabby cat mid-step, looking at the camera with curious eyes",
+                "A futuristic city skyline at night with neon lights and flying cars",
+                "A warm log cabin in a snowy pine forest at twilight",
+                "A colorful wildflower plain under a bright sky",
+            ]
+            student_pipeline.unet.eval()
+            with torch.no_grad(), accelerator.autocast():
+                teacher_eval = [
+                    teacher_pipeline(
+                        p,
+                        num_inference_steps=config.sample.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                    ).images[0]
+                    for p in eval_prompts
                 ]
+                student_eval = [
+                    student_pipeline(
+                        p,
+                        num_inference_steps=config.student.num_steps,
+                        guidance_scale=config.sample.guidance_scale,
+                    ).images[0]
+                    for p in eval_prompts
+                ]
+            save_side_by_side(student_eval, teacher_eval, epoch, outdir)
 
-            # generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
-
-            with torch.no_grad():
-                with accelerator.autocast():
-                    teacher_eval_images = [
-                        teacher_pipeline(
-                            prompt,
-                            num_inference_steps=config.sample.num_steps,
-                            guidance_scale=config.sample.guidance_scale,
-                            # generator=generator
-                        ).images[0]
-                        for prompt in eval_prompts
-                    ]
-
-                    student_eval_images = [
-                        student_pipeline(
-                            prompt,
-                            num_inference_steps=config.student.num_steps,
-                            guidance_scale=config.sample.guidance_scale,
-                            # generator=generator
-                        ).images[0]
-                        for prompt in eval_prompts
-                    ]
-
-        save_side_by_side(student_eval_images, teacher_eval_images, epoch, outdir)
-
-    student_pipeline.save_pretrained(stats_dir + "/student_model/")
+    # ------------------------------------------------------------------ #
+    # Save model & training curves
+    # ------------------------------------------------------------------ #
+    student_pipeline.save_pretrained(os.path.join(stats_dir, "student_model"))
 
     epochs = range(len(all_losses))
 
     plt.figure()
-    plt.plot(epochs, all_losses, label="Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training Loss")
+    plt.plot(epochs, all_losses, label="Total loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training Loss")
     plt.legend()
     plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
     plt.close()
 
-    all_rewards = np.array(all_rewards)
+    all_rewards    = np.array(all_rewards)
     all_rewards_std = np.array(all_rewards_std)
     plt.figure()
-    plt.plot(epochs, all_rewards, label="Reward mean")
-    plt.fill_between(epochs, all_rewards - all_rewards_std, all_rewards + all_rewards_std, alpha=0.3, label="Reward std")
-    plt.xlabel("Epoch")
-    plt.ylabel("Reward")
-    plt.title("Reward Curve")
+    plt.plot(epochs, all_rewards, label=f"Reward ({'+'.join(reward_types)})")
+    plt.fill_between(
+        epochs,
+        all_rewards - all_rewards_std,
+        all_rewards + all_rewards_std,
+        alpha=0.3, label="± std",
+    )
+    plt.xlabel("Epoch"); plt.ylabel("Reward")
+    plt.title(f"Reward Curve (student ↔ teacher)  [{'+'.join(reward_types)}]")
     plt.legend()
     plt.savefig(os.path.join(stats_dir, "reward_curve.png"))
     plt.close()
+
 
 if __name__ == "__main__":
     app.run(main)

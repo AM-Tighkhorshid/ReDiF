@@ -1,449 +1,462 @@
+"""
+rewards.py — reward functions for teacher→student distillation via PPO.
+
+Unified call signature for ALL reward functions inside composite_reward_fn:
+    fn(student_images, teacher_images, prompts) -> (scores: list[float], info: dict|None)
+
+Bugs fixed vs. original
+------------------------
+1. aesthetic_score had the wrong signature (images, prompts, metadata) and
+   didn't handle PIL input. Wrapped into aesthetic_reward_fn with the standard
+   (student_images, teacher_images, prompts) signature.
+2. composite_reward_fn had a dead branch — both arms of
+   `if rtype == "text_image"` called the exact same thing.  Now each reward
+   type is dispatched through its correct wrapper.
+3. DINOv3: `isinstance(images[0], ...)` crashes when `images` is a Tensor
+   (no indexing via [0] for dim-check). Added explicit type guard.
+4. perception_reward_fn: `sims = -dists.squeeze()` collapses to a scalar when
+   batch_size==1. Use `.view(-1)` to keep shape (B,).
+5. All reward functions now return `list[float]` (via .tolist()) so that
+   composite_reward_fn's np.array() conversion is always safe.
+"""
+
+import io
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import numpy as np
-import io
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from transformers import CLIPProcessor, CLIPModel
 
-# === DINOv3 Reward ===
-def dinov3_feature_extractor(device="cuda"):
-    import timm
-    model = timm.create_model('vit_base_patch16_dinov3', pretrained=True).to(device)
-    model.eval()
-    from torchvision import transforms
-    transform = transforms.Compose([
-        transforms.Resize(512),
-        transforms.CenterCrop(512),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+
+# ---------------------------------------------------------------------------
+# Shared image-preprocessing helpers
+# ---------------------------------------------------------------------------
+
+def _pil_or_tensor_to_tensor(images, size: int, mean, std, device):
+    """
+    Accept a list[PIL.Image] or a (B,C,H,W) float tensor in [0,1] or [0,255].
+    Returns a (B,C,size,size) float32 tensor on `device`, normalised with
+    the supplied mean/std.
+    """
+    transform = Compose([
+        Resize(size, interpolation=Image.BICUBIC),
+        CenterCrop(size),
+        ToTensor(),
+        Normalize(mean=mean, std=std),
     ])
-    def encode(images):
-        if isinstance(images[0], Image.Image):
-            images = [transform(img.convert("RGB")).to(device) for img in images]
-            images = torch.stack(images)
-        elif isinstance(images, torch.Tensor):
-            images = images.to(device)
-            if images.max() > 1:
-                images = images / 255.0
-            if images.shape[1] == 3 and images.shape[2] != 512:
-                images = torch.nn.functional.interpolate(images, size=(512, 512), mode="bicubic", align_corners=False)
-            images = images.to(dtype=torch.float32)
-        else:
-            raise TypeError("Images must be PIL or Tensor")
+
+    if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
+        imgs = torch.stack([transform(img.convert("RGB")) for img in images])
+        return imgs.to(device=device, dtype=torch.float32)
+
+    if isinstance(images, torch.Tensor):
+        imgs = images.to(device=device, dtype=torch.float32)
+        if imgs.max() > 1.0 + 1e-3:          # [0,255] → [0,1]
+            imgs = imgs / 255.0
+        if imgs.shape[2] != size or imgs.shape[3] != size:
+            imgs = F.interpolate(imgs, size=(size, size),
+                                 mode="bicubic", align_corners=False)
+        mean_t = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+        std_t  = torch.tensor(std,  device=device).view(1, 3, 1, 1)
+        return (imgs - mean_t) / std_t
+
+    raise TypeError(f"Images must be list[PIL.Image] or torch.Tensor, got {type(images)}")
+
+
+# ---------------------------------------------------------------------------
+# CLIP image–image similarity reward
+# ---------------------------------------------------------------------------
+
+class CLIPSimilarity:
+    """Cosine similarity between student and teacher images in CLIP space."""
+
+    _MEAN = [0.48145466, 0.4578275,  0.40821073]
+    _STD  = [0.26862954, 0.26130258, 0.27577711]
+
+    def __init__(self, device="cuda"):
+        self.device = device
+        self.model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch32"
+        ).to(device).eval()
+        self.model.requires_grad_(False)
+
+    def encode_images(self, images) -> torch.Tensor:
+        """Returns (B, D) L2-normalised float32 embeddings."""
+        imgs = _pil_or_tensor_to_tensor(
+            images, size=224,
+            mean=self._MEAN, std=self._STD,
+            device=self.device,
+        )
         with torch.no_grad():
-            feats = model.forward_features(images)
-            if isinstance(feats, dict) and 'x_norm_patchtokens' in feats:
-                feats = feats['x_norm_patchtokens']
-            feats = F.normalize(feats, dim=-1)
-        return feats
+            embeds = self.model.get_image_features(pixel_values=imgs)
+        return F.normalize(embeds.float(), dim=-1)
+
+    def __call__(self, student_images, teacher_images, prompts=None):
+        s = self.encode_images(student_images)   # (B, D)
+        t = self.encode_images(teacher_images)   # (B, D)
+        sims = F.cosine_similarity(s, t, dim=-1) # (B,)
+        return sims.tolist(), None
+
+
+def clip_similarity_reward_fn(teacher_pipeline, student_pipeline):
+    """Factory — returns a reward_fn with signature (student, teacher, prompts)."""
+    scorer = CLIPSimilarity(device=student_pipeline.device)
+    def reward_fn(student_images, teacher_images, prompts=None):
+        return scorer(student_images, teacher_images, prompts)
+    reward_fn.feature_fn = scorer.encode_images
+    return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# CLIP text–image alignment reward  (student image ↔ prompt text)
+# ---------------------------------------------------------------------------
+
+def clip_text_image_alignment_reward_fn(student_pipeline):
+    """
+    Measures how well the STUDENT image matches the text prompt.
+    Does NOT compare to teacher; useful as an auxiliary signal.
+    """
+    device = student_pipeline.device
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
+    model.requires_grad_(False)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+    _MEAN = [0.48145466, 0.4578275,  0.40821073]
+    _STD  = [0.26862954, 0.26130258, 0.27577711]
+
+    def encode_images(images):
+        imgs = _pil_or_tensor_to_tensor(images, 224, _MEAN, _STD, device)
+        with torch.no_grad():
+            embeds = model.get_image_features(pixel_values=imgs)
+        return F.normalize(embeds.float(), dim=-1)
+
+    def encode_text(prompts):
+        inputs = processor(
+            text=prompts, return_tensors="pt",
+            padding=True, truncation=True,
+        ).to(device)
+        with torch.no_grad():
+            embeds = model.get_text_features(**inputs)
+        return F.normalize(embeds.float(), dim=-1)
+
+    def reward_fn(student_images, teacher_images, prompts):
+        if prompts is None:
+            raise ValueError("prompts are required for text-image alignment reward")
+        img_e  = encode_images(student_images)   # (B, D)
+        text_e = encode_text(prompts)             # (B, D)
+        sims = (img_e * text_e).sum(dim=-1)       # (B,)
+        return sims.tolist(), None
+
+    reward_fn.feature_fn = lambda si, ti: (encode_images(si), encode_text)
+    return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# DINOv2 image–image similarity reward
+# ---------------------------------------------------------------------------
+
+def dinov3_feature_extractor(device="cuda"):
+    """Loads a DINOv2 ViT-B/16 via timm and returns an encode() closure."""
+    import timm
+    model = timm.create_model(
+        'vit_base_patch16_dinov2', pretrained=True   # timm name for DINOv2
+    ).to(device).eval()
+    model.requires_grad_(False)
+
+    _MEAN = [0.485, 0.456, 0.406]
+    _STD  = [0.229, 0.224, 0.225]
+
+    def encode(images):
+        imgs = _pil_or_tensor_to_tensor(images, 512, _MEAN, _STD, device)
+        with torch.no_grad():
+            feats = model.forward_features(imgs)
+        # timm DINOv2 may return a dict or tensor
+        if isinstance(feats, dict):
+            feats = feats.get('x_norm_patchtokens', feats.get('x', feats))
+        return F.normalize(feats.float(), dim=-1)   # (B, tokens, D) or (B, D)
+
     return encode
+
 
 def dinov3_reward_fn(teacher_pipeline, student_pipeline):
     device = student_pipeline.device
     encode = dinov3_feature_extractor(device)
+
     def reward_fn(student_images, teacher_images, prompts=None):
-        s_feats = encode(student_images)
-        t_feats = encode(teacher_images)
-        # If features are [batch, num_tokens, dim], compute cosine similarity for each token, then mean over tokens
-        if s_feats.dim() == 3 and t_feats.dim() == 3:
-            # [batch, num_tokens, dim]
-            sims = F.cosine_similarity(s_feats, t_feats, dim=2)  # [batch, num_tokens]
-            sims = sims.mean(dim=1)  # [batch]
+        s = encode(student_images)   # (B, T, D) or (B, D)
+        t = encode(teacher_images)
+        if s.dim() == 3:
+            sims = F.cosine_similarity(s, t, dim=2).mean(dim=1)  # (B,)
         else:
-            sims = F.cosine_similarity(s_feats, t_feats, dim=-1)  # [batch]
-        # print(f"[DINOv3 Reward] reward shape: {sims.shape}")
+            sims = F.cosine_similarity(s, t, dim=-1)             # (B,)
         return sims.tolist(), None
+
     def feature_fn(student_images, teacher_images):
-        s_feats = encode(student_images)
-        t_feats = encode(teacher_images)
-        return s_feats, t_feats
+        return encode(student_images), encode(teacher_images)
+
     reward_fn.feature_fn = feature_fn
     return reward_fn
 
-# === Perception Reward (LPIPS) ===
-def perception_feature_extractor(device="cuda"):
-    import lpips
-    model = lpips.LPIPS(net='vgg').to(device)
-    model.eval()
-    from torchvision import transforms
-    transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])
-    def encode(images):
-        if isinstance(images[0], Image.Image):
-            images = [transform(img.convert("RGB")).unsqueeze(0).to(device) for img in images]
-            images = torch.cat(images, dim=0)
-        elif isinstance(images, torch.Tensor):
-            images = images.to(device)
-            if images.max() > 1:
-                images = images / 255.0
-            if images.shape[1] == 3 and images.shape[2] != 224:
-                images = torch.nn.functional.interpolate(images, size=(224, 224), mode="bicubic", align_corners=False)
-            images = images.to(dtype=torch.float32)
-        else:
-            raise TypeError("Images must be PIL or Tensor")
-        return images
-    return encode, model
+
+# ---------------------------------------------------------------------------
+# Perceptual (LPIPS) reward  — lower LPIPS = better = higher reward
+# ---------------------------------------------------------------------------
 
 def perception_reward_fn(teacher_pipeline, student_pipeline):
+    import lpips
     device = student_pipeline.device
-    encode, model = perception_feature_extractor(device)
-    def reward_fn(student_images, teacher_images, prompts=None):
-        s_imgs = encode(student_images)
-        t_imgs = encode(teacher_images)
-        with torch.no_grad():
-            dists = model(s_imgs, t_imgs)
-            sims = -dists.squeeze()
-        # print(f"[Perception Reward] reward shape: {sims.shape}")
-        return sims.tolist(), None
-    def feature_fn(student_images, teacher_images):
-        s_imgs = encode(student_images)
-        t_imgs = encode(teacher_images)
-        return s_imgs, t_imgs
-    reward_fn.feature_fn = feature_fn
-    return reward_fn
+    model = lpips.LPIPS(net='vgg').to(device).eval()
+    model.requires_grad_(False)
 
-
-# === Text-Image Alignment Reward ===
-def clip_text_image_alignment_reward_fn(student_pipeline):
-    from transformers import CLIPProcessor, CLIPModel
-    device = student_pipeline.device
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-    transform = Compose([
-        Resize(224, interpolation=Image.BICUBIC),
-        CenterCrop(224),
-        ToTensor(),
-        Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                  std=[0.26862954, 0.26130258, 0.27577711]),
-    ])
-    def encode_images(images):
-        if isinstance(images[0], Image.Image):
-            images = [transform(img.convert("RGB")).to(device) for img in images]
-            images = torch.stack(images)
+    # LPIPS expects images in [-1, 1]
+    def _prep(images):
+        if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
+            from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor
+            t = Compose([Resize(224), CenterCrop(224), ToTensor()])
+            imgs = torch.stack([t(img.convert("RGB")) for img in images])
         elif isinstance(images, torch.Tensor):
-            images = images.to(device)
-            if images.max() > 1:
-                images = images / 255.0
-            if images.shape[1] == 3 and images.shape[2] != 224:
-                images = torch.nn.functional.interpolate(images, size=(224, 224), mode="bicubic", align_corners=False)
-            images = images.to(dtype=torch.float32)
+            imgs = images.float()
+            if imgs.max() > 1.0 + 1e-3:
+                imgs = imgs / 255.0
+            if imgs.shape[2] != 224 or imgs.shape[3] != 224:
+                imgs = F.interpolate(imgs, (224, 224), mode="bicubic", align_corners=False)
         else:
-            raise TypeError("Images must be PIL or Tensor")
+            raise TypeError(f"Unsupported image type: {type(images)}")
+        return (imgs * 2.0 - 1.0).to(device=device, dtype=torch.float32)  # [0,1]→[-1,1]
+
+    def reward_fn(student_images, teacher_images, prompts=None):
+        s = _prep(student_images)
+        t = _prep(teacher_images)
         with torch.no_grad():
-            image_embeds = model.get_image_features(pixel_values=images)
-            image_embeds = F.normalize(image_embeds, dim=-1)
-        return image_embeds
-    def encode_text(prompts):
-        inputs = processor(text=prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-        with torch.no_grad():
-            text_embeds = model.get_text_features(**inputs)
-            text_embeds = F.normalize(text_embeds, dim=-1)
-        return text_embeds
-    def reward_fn(student_images, teacher_images, prompts):
-        # Only use student_images and prompts
-        if prompts is None:
-            raise ValueError("prompts required for text-image alignment reward")
-        image_embeds = encode_images(student_images)
-        text_embeds = encode_text(prompts)
-        sims = (image_embeds * text_embeds).sum(dim=-1)
-        # print(f"[Text-Image Alignment Reward] reward shape: {sims.shape}")
+            dists = model(s, t)
+        # dists shape: (B, 1, 1, 1) — flatten to (B,) and negate (lower dist = better)
+        sims = -dists.view(-1)
         return sims.tolist(), None
-    def feature_fn(student_images, prompts):
-        image_embeds = encode_images(student_images)
-        text_embeds = encode_text(prompts)
-        return image_embeds, text_embeds
+
+    def feature_fn(student_images, teacher_images):
+        return _prep(student_images), _prep(teacher_images)
+
     reward_fn.feature_fn = feature_fn
     return reward_fn
 
-# === Composite Reward Function ===
+
+# ---------------------------------------------------------------------------
+# Aesthetic score reward  (student image only, no teacher comparison)
+# ---------------------------------------------------------------------------
+
+def aesthetic_reward_fn(student_pipeline):
+    """
+    Scores the aesthetic quality of the STUDENT image using the LAION aesthetic
+    predictor. Works as an auxiliary reward on top of a similarity reward.
+    """
+    from ddpo_pytorch.aesthetic_scorer import AestheticScorer
+    device = student_pipeline.device
+    scorer = AestheticScorer(dtype=torch.float32).to(device).eval()
+    scorer.requires_grad_(False)
+
+    def _prep(images):
+        """Returns (B, C, H, W) uint8 tensor on device."""
+        if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
+            from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor
+            t = Compose([Resize(224), CenterCrop(224), ToTensor()])
+            imgs = torch.stack([t(img.convert("RGB")) for img in images])
+            return (imgs * 255).round().clamp(0, 255).to(torch.uint8).to(device)
+        if isinstance(images, torch.Tensor):
+            imgs = images.to(device)
+            if imgs.dtype != torch.uint8:
+                imgs = (imgs * 255).round().clamp(0, 255).to(torch.uint8)
+            if imgs.shape[2] != 224 or imgs.shape[3] != 224:
+                imgs_f = imgs.float() / 255.0
+                imgs_f = F.interpolate(imgs_f, (224, 224), mode="bicubic", align_corners=False)
+                imgs = (imgs_f * 255).round().clamp(0, 255).to(torch.uint8)
+            return imgs
+        raise TypeError(f"Unsupported image type: {type(images)}")
+
+    def reward_fn(student_images, teacher_images, prompts=None):
+        imgs = _prep(student_images)
+        with torch.no_grad():
+            scores = scorer(imgs)   # (B,) float
+        if isinstance(scores, torch.Tensor):
+            return scores.tolist(), None
+        return list(scores), None
+
+    return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# Composite reward  (the single entry-point used by the training script)
+# ---------------------------------------------------------------------------
+
 def get_reward_fn(reward_types, teacher_pipeline, student_pipeline):
     """
-    reward_types: str or list of str, e.g. 'clip' or ['clip', 'dino', 'aesthetic', 'text_image']
-    Returns a function that computes all selected rewards and returns their sum and details.
+    Build a composite reward that sums all requested reward types.
+
+    Supported reward_types
+    ----------------------
+    "clip"        – CLIP image-image cosine similarity (student ↔ teacher)
+    "dino"        – DINOv2 patch-token cosine similarity (student ↔ teacher)
+    "perception"  – negative LPIPS perceptual distance  (student ↔ teacher)
+    "text_image"  – CLIP image-text alignment           (student image ↔ prompt)
+    "aesthetic"   – LAION aesthetic score               (student image only)
+
+    Returns
+    -------
+    composite_reward_fn(student_images, teacher_images, prompts)
+        → (total: list[float], details: dict[str, list[float]])
     """
     if isinstance(reward_types, str):
         reward_types = [reward_types]
+
     reward_fns = []
     for rtype in reward_types:
         if rtype == "clip":
             reward_fns.append(clip_similarity_reward_fn(teacher_pipeline, student_pipeline))
         elif rtype == "dino":
             reward_fns.append(dinov3_reward_fn(teacher_pipeline, student_pipeline))
-        elif rtype == "aesthetic":
-            reward_fns.append(aesthetic_score())
         elif rtype == "perception":
             reward_fns.append(perception_reward_fn(teacher_pipeline, student_pipeline))
         elif rtype == "text_image":
             reward_fns.append(clip_text_image_alignment_reward_fn(student_pipeline))
+        elif rtype == "aesthetic":
+            reward_fns.append(aesthetic_reward_fn(student_pipeline))
         else:
-            raise ValueError(f"Unknown reward_type: {rtype}")
+            raise ValueError(
+                f"Unknown reward_type: '{rtype}'. "
+                "Choose from: clip, dino, perception, text_image, aesthetic."
+            )
+
     def composite_reward_fn(student_images, teacher_images, prompts=None):
-        total = None
-        details = {}
+        total_np = None
+        details  = {}
         for fn, rtype in zip(reward_fns, reward_types):
-            if rtype == "text_image":
-                rew, info = fn(student_images, teacher_images, prompts)
-            else:
-                rew, info = fn(student_images, teacher_images, prompts)
-            details[rtype] = rew
-            # Handle torch.Tensor on CUDA
+            # All reward_fns share the same 3-arg signature:
+            #   fn(student_images, teacher_images, prompts) → (scores, info)
+            rew, info = fn(student_images, teacher_images, prompts)
+
+            # Normalise to numpy array
             if isinstance(rew, torch.Tensor):
-                rew_np = rew.detach().cpu().numpy()
+                rew_np = rew.detach().cpu().float().numpy()
             else:
-                rew_np = np.array(rew)
-            if total is None:
-                total = rew_np
-            else:
-                total += rew_np
-        return total.tolist(), details
-    composite_reward_fn.reward_fns = reward_fns
+                rew_np = np.array(rew, dtype=np.float32)
+
+            details[rtype] = rew_np.tolist()
+
+            total_np = rew_np if total_np is None else total_np + rew_np
+
+        return total_np.tolist(), details
+
+    composite_reward_fn.reward_fns   = reward_fns
+    composite_reward_fn.reward_types = reward_types
     return composite_reward_fn
 
-from PIL import Image
-import io
-import numpy as np
-import torch
 
-# File: ddpo_pytorch/rewards/clip_similarity_reward.py
-
-import torch
-import torch.nn.functional as F
-from transformers import CLIPProcessor, CLIPModel
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-from PIL import Image
-
-class CLIPSimilarity:
-    def __init__(self, device="cuda"):
-        self.device = device
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.transform = Compose([
-            Resize(224, interpolation=Image.BICUBIC),
-            CenterCrop(224),
-            ToTensor(),
-            Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                      std=[0.26862954, 0.26130258, 0.27577711]),
-        ])
-
-    def encode_images(self, images):
-        if isinstance(images[0], Image.Image):
-            images = [self.transform(img.convert("RGB")).to(self.device) for img in images]
-            images = torch.stack(images)
-        elif isinstance(images, torch.Tensor):
-            images = images.to(self.device)
-            if images.max() > 1:
-                images = images / 255.0
-            if images.shape[1] == 3 and images.shape[2] != 224:
-                images = torch.nn.functional.interpolate(images, size=(224, 224), mode="bicubic", align_corners=False)
-            images = images.to(dtype=torch.float32)  # 👈 ensure correct dtype for CLIP
-        else:
-            raise TypeError("Images must be PIL or Tensor")
-
-        with torch.no_grad():
-            image_embeds = self.model.get_image_features(pixel_values=images)
-            image_embeds = F.normalize(image_embeds, dim=-1)
-        return image_embeds
-
-    def __call__(self, student_images, teacher_images, prompts=None):
-        student_embeds = self.encode_images(student_images)
-        teacher_embeds = self.encode_images(teacher_images)
-        sims = F.cosine_similarity(student_embeds, teacher_embeds, dim=-1)
-        # print(f"[CLIP Reward] reward shape: {sims.shape}")
-        return sims.tolist(), None
-
-
-def clip_similarity_reward_fn(teacher_pipeline, student_pipeline):
-    device = student_pipeline.device
-    scorer = CLIPSimilarity(device=device)
-    def reward_fn(student_images, teacher_images, prompts=None):
-        return scorer(student_images, teacher_images, prompts)
-    return reward_fn
-
-
+# ---------------------------------------------------------------------------
+# Legacy / standalone utilities (unchanged, kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        images = [Image.fromarray(image) for image in images]
+            images = images.transpose(0, 2, 3, 1)
+        images = [Image.fromarray(img) for img in images]
         buffers = [io.BytesIO() for _ in images]
-        for image, buffer in zip(images, buffers):
-            image.save(buffer, format="JPEG", quality=95)
-        sizes = [buffer.tell() / 1000 for buffer in buffers]
+        for img, buf in zip(images, buffers):
+            img.save(buf, format="JPEG", quality=95)
+        sizes = [buf.tell() / 1000 for buf in buffers]
         return np.array(sizes), {}
-
     return _fn
 
 
 def jpeg_compressibility():
     jpeg_fn = jpeg_incompressibility()
-
     def _fn(images, prompts, metadata):
         rew, meta = jpeg_fn(images, prompts, metadata)
         return -rew, meta
-
-    return _fn
-
-
-def aesthetic_score():
-    from ddpo_pytorch.aesthetic_scorer import AestheticScorer
-
-    scorer = AestheticScorer(dtype=torch.float32).cuda()
-
-    def _fn(images, prompts, metadata):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8)
-        else:
-            images = images.transpose(0, 3, 1, 2)  # NHWC -> NCHW
-            images = torch.tensor(images, dtype=torch.uint8)
-        scores = scorer(images)
-        return scores, {}
-
     return _fn
 
 
 def llava_strict_satisfaction():
-    """Submits images to LLaVA and computes a reward by matching the responses to ground truth answers directly without
-    using BERTScore. Prompt metadata must have "questions" and "answers" keys. See
-    https://github.com/kvablack/LLaVA-server for server-side code.
-    """
-    import requests
+    import requests, pickle
     from requests.adapters import HTTPAdapter, Retry
     from io import BytesIO
-    import pickle
 
     batch_size = 4
-    url = "http://127.0.0.1:8085"
+    url  = "http://127.0.0.1:8085"
     sess = requests.Session()
-    retries = Retry(
-        total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False
-    )
-    sess.mount("http://", HTTPAdapter(max_retries=retries))
+    sess.mount("http://", HTTPAdapter(max_retries=Retry(
+        total=1000, backoff_factor=1,
+        status_forcelist=[500], allowed_methods=False
+    )))
 
     def _fn(images, prompts, metadata):
         del prompts
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-
-        images_batched = np.array_split(images, np.ceil(len(images) / batch_size))
-        metadata_batched = np.array_split(metadata, np.ceil(len(metadata) / batch_size))
-
-        all_scores = []
-        all_info = {
-            "answers": [],
-        }
-        for image_batch, metadata_batch in zip(images_batched, metadata_batched):
-            jpeg_images = []
-
-            # Compress the images using JPEG
-            for image in image_batch:
-                img = Image.fromarray(image)
-                buffer = BytesIO()
-                img.save(buffer, format="JPEG", quality=80)
-                jpeg_images.append(buffer.getvalue())
-
-            # format for LLaVA server
-            data = {
-                "images": jpeg_images,
-                "queries": [m["questions"] for m in metadata_batch],
-            }
-            data_bytes = pickle.dumps(data)
-
-            # send a request to the llava server
-            response = sess.post(url, data=data_bytes, timeout=120)
-
-            response_data = pickle.loads(response.content)
-
-            correct = np.array(
-                [
-                    [ans in resp for ans, resp in zip(m["answers"], responses)]
-                    for m, responses in zip(metadata_batch, response_data["outputs"])
-                ]
-            )
-            scores = correct.mean(axis=-1)
-
-            all_scores += scores.tolist()
-            all_info["answers"] += response_data["outputs"]
-
+            images = images.transpose(0, 2, 3, 1)
+        n = len(images)
+        images_batched   = np.array_split(images,   int(np.ceil(n / batch_size)))
+        metadata_batched = np.array_split(metadata, int(np.ceil(n / batch_size)))
+        all_scores, all_info = [], {"answers": []}
+        for img_batch, meta_batch in zip(images_batched, metadata_batched):
+            jpegs = []
+            for img in img_batch:
+                buf = io.BytesIO()
+                Image.fromarray(img).save(buf, format="JPEG", quality=80)
+                jpegs.append(buf.getvalue())
+            resp = sess.post(url, data=pickle.dumps({
+                "images": jpegs,
+                "queries": [m["questions"] for m in meta_batch],
+            }), timeout=120)
+            rd = pickle.loads(resp.content)
+            correct = np.array([
+                [ans in r for ans, r in zip(m["answers"], responses)]
+                for m, responses in zip(meta_batch, rd["outputs"])
+            ])
+            all_scores += correct.mean(axis=-1).tolist()
+            all_info["answers"] += rd["outputs"]
         return np.array(all_scores), {k: np.array(v) for k, v in all_info.items()}
-
     return _fn
 
 
 def llava_bertscore():
-    """Submits images to LLaVA and computes a reward by comparing the responses to the prompts using BERTScore. See
-    https://github.com/kvablack/LLaVA-server for server-side code.
-    """
-    import requests
+    import requests, pickle
     from requests.adapters import HTTPAdapter, Retry
     from io import BytesIO
-    import pickle
 
     batch_size = 16
-    url = "http://127.0.0.1:8085"
+    url  = "http://127.0.0.1:8085"
     sess = requests.Session()
-    retries = Retry(
-        total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False
-    )
-    sess.mount("http://", HTTPAdapter(max_retries=retries))
+    sess.mount("http://", HTTPAdapter(max_retries=Retry(
+        total=1000, backoff_factor=1,
+        status_forcelist=[500], allowed_methods=False
+    )))
 
     def _fn(images, prompts, metadata):
         del metadata
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-
-        images_batched = np.array_split(images, np.ceil(len(images) / batch_size))
-        prompts_batched = np.array_split(prompts, np.ceil(len(prompts) / batch_size))
-
-        all_scores = []
-        all_info = {
-            "precision": [],
-            "f1": [],
-            "outputs": [],
-        }
-        for image_batch, prompt_batch in zip(images_batched, prompts_batched):
-            jpeg_images = []
-
-            # Compress the images using JPEG
-            for image in image_batch:
-                img = Image.fromarray(image)
-                buffer = BytesIO()
-                img.save(buffer, format="JPEG", quality=80)
-                jpeg_images.append(buffer.getvalue())
-
-            # format for LLaVA server
-            data = {
-                "images": jpeg_images,
-                "queries": [["Answer concisely: what is going on in this image?"]]
-                * len(image_batch),
-                "answers": [
-                    [f"The image contains {prompt}"] for prompt in prompt_batch
-                ],
-            }
-            data_bytes = pickle.dumps(data)
-
-            # send a request to the llava server
-            response = sess.post(url, data=data_bytes, timeout=120)
-
-            response_data = pickle.loads(response.content)
-
-            # use the recall score as the reward
-            scores = np.array(response_data["recall"]).squeeze()
-            all_scores += scores.tolist()
-
-            # save the precision and f1 scores for analysis
-            all_info["precision"] += (
-                np.array(response_data["precision"]).squeeze().tolist()
-            )
-            all_info["f1"] += np.array(response_data["f1"]).squeeze().tolist()
-            all_info["outputs"] += np.array(response_data["outputs"]).squeeze().tolist()
-
+            images = images.transpose(0, 2, 3, 1)
+        n = len(images)
+        images_batched  = np.array_split(images,  int(np.ceil(n / batch_size)))
+        prompts_batched = np.array_split(prompts, int(np.ceil(n / batch_size)))
+        all_scores, all_info = [], {"precision": [], "f1": [], "outputs": []}
+        for img_batch, prompt_batch in zip(images_batched, prompts_batched):
+            jpegs = []
+            for img in img_batch:
+                buf = io.BytesIO()
+                Image.fromarray(img).save(buf, format="JPEG", quality=80)
+                jpegs.append(buf.getvalue())
+            resp = sess.post(url, data=pickle.dumps({
+                "images":  jpegs,
+                "queries": [["Answer concisely: what is going on in this image?"]] * len(img_batch),
+                "answers": [[f"The image contains {p}"] for p in prompt_batch],
+            }), timeout=120)
+            rd = pickle.loads(resp.content)
+            all_scores += np.array(rd["recall"]).squeeze().tolist()
+            all_info["precision"] += np.array(rd["precision"]).squeeze().tolist()
+            all_info["f1"]        += np.array(rd["f1"]).squeeze().tolist()
+            all_info["outputs"]   += np.array(rd["outputs"]).squeeze().tolist()
         return np.array(all_scores), {k: np.array(v) for k, v in all_info.items()}
-
     return _fn
