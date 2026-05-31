@@ -4,20 +4,19 @@ rewards.py — reward functions for teacher→student distillation via PPO.
 Unified call signature for ALL reward functions inside composite_reward_fn:
     fn(student_images, teacher_images, prompts) -> (scores: list[float], info: dict|None)
 
-Bugs fixed vs. original
-------------------------
-1. aesthetic_score had the wrong signature (images, prompts, metadata) and
-   didn't handle PIL input. Wrapped into aesthetic_reward_fn with the standard
-   (student_images, teacher_images, prompts) signature.
-2. composite_reward_fn had a dead branch — both arms of
-   `if rtype == "text_image"` called the exact same thing.  Now each reward
-   type is dispatched through its correct wrapper.
-3. DINOv3: `isinstance(images[0], ...)` crashes when `images` is a Tensor
-   (no indexing via [0] for dim-check). Added explicit type guard.
-4. perception_reward_fn: `sims = -dists.squeeze()` collapses to a scalar when
-   batch_size==1. Use `.view(-1)` to keep shape (B,).
-5. All reward functions now return `list[float]` (via .tolist()) so that
-   composite_reward_fn's np.array() conversion is always safe.
+Reward types
+------------
+"clip"        – CLIP image-image cosine similarity        (student ↔ teacher)
+"dino"        – DINOv2 patch-token cosine similarity      (student ↔ teacher)
+"perception"  – negative LPIPS perceptual distance        (student ↔ teacher)
+"text_image"  – CLIP image-text alignment                 (student image ↔ prompt)
+"aesthetic"   – LAION aesthetic score                     (student image only)
+"mse"         – negative MSE between student and teacher  (student ↔ teacher)
+               This is the diffusion reconstruction loss turned into a reward:
+               reward = -MSE(student_pixels, teacher_pixels)
+               A less negative (higher) reward means the student image is
+               closer to the teacher image in pixel space, identical to the
+               standard L2 diffusion loss but used as an RL reward signal.
 """
 
 import io
@@ -62,6 +61,77 @@ def _pil_or_tensor_to_tensor(images, size: int, mean, std, device):
         return (imgs - mean_t) / std_t
 
     raise TypeError(f"Images must be list[PIL.Image] or torch.Tensor, got {type(images)}")
+
+
+def _to_float_tensor(images, device):
+    """
+    Convert images to a (B,C,H,W) float32 tensor in [0,1] on `device`,
+    WITHOUT any normalisation. Used for pixel-space MSE.
+    """
+    if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
+        t = Compose([ToTensor()])
+        imgs = torch.stack([t(img.convert("RGB")) for img in images])
+        return imgs.to(device=device, dtype=torch.float32)
+
+    if isinstance(images, torch.Tensor):
+        imgs = images.to(device=device, dtype=torch.float32)
+        if imgs.max() > 1.0 + 1e-3:
+            imgs = imgs / 255.0
+        return imgs
+
+    raise TypeError(f"Images must be list[PIL.Image] or torch.Tensor, got {type(images)}")
+
+
+# ---------------------------------------------------------------------------
+# MSE Reconstruction Reward
+# ---------------------------------------------------------------------------
+
+def mse_reconstruction_reward_fn(teacher_pipeline, student_pipeline):
+    """
+    Negative pixel-space MSE between student and teacher final output images.
+
+    This directly mirrors the standard diffusion reconstruction loss (L2),
+    but used as an RL reward signal so the student learns via policy gradients
+    instead of direct backpropagation through the teacher.
+
+    reward_i = -MSE(student_image_i, teacher_image_i)
+
+    A reward of 0.0 means pixel-perfect match. More negative means worse.
+    Typical range is roughly [-0.5, 0.0] for SD outputs.
+
+    Args:
+        teacher_pipeline: the frozen teacher StableDiffusionPipeline
+        student_pipeline: the trainable student StableDiffusionPipeline
+
+    Returns:
+        reward_fn(student_images, teacher_images, prompts)
+            -> (scores: list[float], info: dict)
+    """
+    device = student_pipeline.device
+
+    def reward_fn(student_images, teacher_images, prompts=None):
+        # Convert both to unnormalised [0,1] float tensors — same as diffusion L2 target
+        s = _to_float_tensor(student_images, device)   # (B, 3, H, W)
+        t = _to_float_tensor(teacher_images, device)   # (B, 3, H, W)
+
+        # Resize to a common resolution if they differ (edge case)
+        if s.shape != t.shape:
+            t = F.interpolate(t, size=s.shape[2:], mode="bicubic", align_corners=False)
+
+        with torch.no_grad():
+            # Per-sample MSE: mean over (C, H, W), keep batch dim
+            mse_per_sample = ((s - t) ** 2).mean(dim=[1, 2, 3])   # (B,)
+
+            # Negate: higher reward = lower MSE = better reconstruction
+            reward = -mse_per_sample                               # (B,)
+
+        info = {
+            "mse": mse_per_sample.tolist(),
+            "rmse": mse_per_sample.sqrt().tolist(),
+        }
+        return reward.tolist(), info
+
+    return reward_fn
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +230,7 @@ def dinov3_feature_extractor(device="cuda"):
     """Loads a DINOv2 ViT-B/16 via timm and returns an encode() closure."""
     import timm
     model = timm.create_model(
-        'vit_base_patch16_dinov2', pretrained=True   # timm name for DINOv2
+        'vit_base_patch16_dinov2', pretrained=True
     ).to(device).eval()
     model.requires_grad_(False)
 
@@ -171,10 +241,9 @@ def dinov3_feature_extractor(device="cuda"):
         imgs = _pil_or_tensor_to_tensor(images, 512, _MEAN, _STD, device)
         with torch.no_grad():
             feats = model.forward_features(imgs)
-        # timm DINOv2 may return a dict or tensor
         if isinstance(feats, dict):
             feats = feats.get('x_norm_patchtokens', feats.get('x', feats))
-        return F.normalize(feats.float(), dim=-1)   # (B, tokens, D) or (B, D)
+        return F.normalize(feats.float(), dim=-1)
 
     return encode
 
@@ -184,12 +253,12 @@ def dinov3_reward_fn(teacher_pipeline, student_pipeline):
     encode = dinov3_feature_extractor(device)
 
     def reward_fn(student_images, teacher_images, prompts=None):
-        s = encode(student_images)   # (B, T, D) or (B, D)
+        s = encode(student_images)
         t = encode(teacher_images)
         if s.dim() == 3:
-            sims = F.cosine_similarity(s, t, dim=2).mean(dim=1)  # (B,)
+            sims = F.cosine_similarity(s, t, dim=2).mean(dim=1)
         else:
-            sims = F.cosine_similarity(s, t, dim=-1)             # (B,)
+            sims = F.cosine_similarity(s, t, dim=-1)
         return sims.tolist(), None
 
     def feature_fn(student_images, teacher_images):
@@ -209,7 +278,6 @@ def perception_reward_fn(teacher_pipeline, student_pipeline):
     model = lpips.LPIPS(net='vgg').to(device).eval()
     model.requires_grad_(False)
 
-    # LPIPS expects images in [-1, 1]
     def _prep(images):
         if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
             from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor
@@ -223,14 +291,13 @@ def perception_reward_fn(teacher_pipeline, student_pipeline):
                 imgs = F.interpolate(imgs, (224, 224), mode="bicubic", align_corners=False)
         else:
             raise TypeError(f"Unsupported image type: {type(images)}")
-        return (imgs * 2.0 - 1.0).to(device=device, dtype=torch.float32)  # [0,1]→[-1,1]
+        return (imgs * 2.0 - 1.0).to(device=device, dtype=torch.float32)
 
     def reward_fn(student_images, teacher_images, prompts=None):
         s = _prep(student_images)
         t = _prep(teacher_images)
         with torch.no_grad():
             dists = model(s, t)
-        # dists shape: (B, 1, 1, 1) — flatten to (B,) and negate (lower dist = better)
         sims = -dists.view(-1)
         return sims.tolist(), None
 
@@ -246,17 +313,12 @@ def perception_reward_fn(teacher_pipeline, student_pipeline):
 # ---------------------------------------------------------------------------
 
 def aesthetic_reward_fn(student_pipeline):
-    """
-    Scores the aesthetic quality of the STUDENT image using the LAION aesthetic
-    predictor. Works as an auxiliary reward on top of a similarity reward.
-    """
     from ddpo_pytorch.aesthetic_scorer import AestheticScorer
     device = student_pipeline.device
     scorer = AestheticScorer(dtype=torch.float32).to(device).eval()
     scorer.requires_grad_(False)
 
     def _prep(images):
-        """Returns (B, C, H, W) uint8 tensor on device."""
         if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
             from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor
             t = Compose([Resize(224), CenterCrop(224), ToTensor()])
@@ -276,7 +338,7 @@ def aesthetic_reward_fn(student_pipeline):
     def reward_fn(student_images, teacher_images, prompts=None):
         imgs = _prep(student_images)
         with torch.no_grad():
-            scores = scorer(imgs)   # (B,) float
+            scores = scorer(imgs)
         if isinstance(scores, torch.Tensor):
             return scores.tolist(), None
         return list(scores), None
@@ -299,6 +361,11 @@ def get_reward_fn(reward_types, teacher_pipeline, student_pipeline):
     "perception"  – negative LPIPS perceptual distance  (student ↔ teacher)
     "text_image"  – CLIP image-text alignment           (student image ↔ prompt)
     "aesthetic"   – LAION aesthetic score               (student image only)
+    "mse"         – negative pixel MSE                  (student ↔ teacher)
+                    This is the diffusion reconstruction loss as an RL reward.
+                    reward = -MSE(student_pixels, teacher_pixels)
+                    Range: roughly [-0.5, 0.0]. Combines naturally with clip
+                    (which lives in [0,1]) for a joint pixel+semantic reward.
 
     Returns
     -------
@@ -320,21 +387,20 @@ def get_reward_fn(reward_types, teacher_pipeline, student_pipeline):
             reward_fns.append(clip_text_image_alignment_reward_fn(student_pipeline))
         elif rtype == "aesthetic":
             reward_fns.append(aesthetic_reward_fn(student_pipeline))
+        elif rtype == "mse":
+            reward_fns.append(mse_reconstruction_reward_fn(teacher_pipeline, student_pipeline))
         else:
             raise ValueError(
                 f"Unknown reward_type: '{rtype}'. "
-                "Choose from: clip, dino, perception, text_image, aesthetic."
+                "Choose from: clip, dino, perception, text_image, aesthetic, mse."
             )
 
     def composite_reward_fn(student_images, teacher_images, prompts=None):
         total_np = None
         details  = {}
         for fn, rtype in zip(reward_fns, reward_types):
-            # All reward_fns share the same 3-arg signature:
-            #   fn(student_images, teacher_images, prompts) → (scores, info)
             rew, info = fn(student_images, teacher_images, prompts)
 
-            # Normalise to numpy array
             if isinstance(rew, torch.Tensor):
                 rew_np = rew.detach().cpu().float().numpy()
             else:
