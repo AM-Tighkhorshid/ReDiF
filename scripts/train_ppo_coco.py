@@ -28,6 +28,7 @@ from diffusers.models.attention_processor import LoRAAttnProcessor
 
 import numpy as np
 import torch
+import torch.distributed
 import torch.nn.functional as F
 from functools import partial
 import tqdm
@@ -62,7 +63,7 @@ flags.DEFINE_string(
     "Path to COCO annotations directory.",
 )
 flags.DEFINE_float(
-    "kl_lambda", 0.5,
+    "kl_lambda", 0,
     "Weight λ for the latent KL regularisation term in the total loss.",
 )
 flags.DEFINE_list(
@@ -132,11 +133,11 @@ def main(_):
     reward_tag = "_".join(reward_types)
     outdir  = f"PPO_{reward_tag}_kl{FLAGS.kl_lambda}"
     outdir += "_coco" if FLAGS.prompt_source == "coco" else "_ddpo"
+    outdir += "_batch_size_" + str(config.sample.batch_size)
 
-    outdir = outdir + "_____second_try"
+    outdir = outdir + "_____third_try"
 
     stats_dir  = outdir
-    os.makedirs(stats_dir, exist_ok=True)
     stats_file = os.path.join(stats_dir, "training_stats.txt")
 
     all_losses, all_rewards, all_rewards_std = [], [], []
@@ -158,6 +159,11 @@ def main(_):
     )
     set_seed(config.seed, device_specific=True)
 
+    # Create output dir only on main process
+    if accelerator.is_main_process:
+        os.makedirs(stats_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
     if accelerator.is_main_process:
         accelerator.init_trackers(
             "ddpo-distill",
@@ -172,6 +178,7 @@ def main(_):
     # ------------------------------------------------------------------ #
     # Teacher pipeline  (all frozen)
     # ------------------------------------------------------------------ #
+    # Load to CPU first; each rank will move to its own device after prepare().
     teacher_pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained.model, revision=config.pretrained.revision
     )
@@ -180,11 +187,11 @@ def main(_):
     )
     teacher_pipeline.safety_checker = None
     teacher_pipeline.set_progress_bar_config(disable=True)
-    teacher_pipeline.to(accelerator.device)
     teacher_pipeline.vae.requires_grad_(False)
     teacher_pipeline.text_encoder.requires_grad_(False)
     teacher_pipeline.unet.requires_grad_(False)
-    teacher_pipeline.save_pretrained(config.teacher_output_dir)
+    if accelerator.is_main_process:
+        teacher_pipeline.save_pretrained(config.teacher_output_dir)
 
     # ------------------------------------------------------------------ #
     # Student pipeline  (UNet or LoRA trainable)
@@ -197,7 +204,9 @@ def main(_):
     )
     student_pipeline.safety_checker = None
     student_pipeline.set_progress_bar_config(disable=True)
-    student_pipeline.to(accelerator.device)
+    # NOTE: do NOT call .to(device) here — accelerator.prepare() handles placement
+    # so each rank lands on its own GPU. Calling .to(accelerator.device) before
+    # prepare() causes both ranks to target GPU 0, which causes CUDA crashes.
     student_pipeline.vae.requires_grad_(False)
     student_pipeline.text_encoder.requires_grad_(False)
 
@@ -234,7 +243,24 @@ def main(_):
         student_pipeline.unet.requires_grad_(True)
         unet = student_pipeline.unet
 
-    # Cast frozen parts to training dtype
+    optimizer = torch.optim.AdamW(
+        unet.parameters(),
+        lr=config.train.learning_rate,
+        betas=(config.train.adam_beta1, config.train.adam_beta2),
+        weight_decay=config.train.adam_weight_decay,
+        eps=config.train.adam_epsilon,
+    )
+    # prepare() must come FIRST — it assigns each rank to its own GPU device.
+    # Only after this call is accelerator.device reliable per-rank.
+    unet, optimizer = accelerator.prepare(unet, optimizer)
+
+    # ------------------------------------------------------------------ #
+    # Move everything to the correct per-rank device AFTER prepare()
+    # ------------------------------------------------------------------ #
+    # accelerator.prepare() already placed `unet` (and wrapped optimizer) on the
+    # right device.  We now move the frozen components of both pipelines.
+    teacher_pipeline.to(accelerator.device)
+
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(
         accelerator.mixed_precision, torch.float32
     )
@@ -243,27 +269,19 @@ def main(_):
     if config.use_lora:
         student_pipeline.unet.to(accelerator.device, dtype=dtype)
 
-    optimizer = torch.optim.AdamW(
-        unet.parameters(),
-        lr=config.train.learning_rate,
-        betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=config.train.adam_weight_decay,
-        eps=config.train.adam_epsilon,
-    )
-    unet, optimizer = accelerator.prepare(unet, optimizer)
-
-    lora_params = sum(
-        p.numel()
-        for m in student_pipeline.unet.attn_processors.values()
-        for p in m.parameters()
-    )
-    logger.info(f"LoRA parameters: {lora_params:,}")
+    if accelerator.is_main_process:
+        lora_params = sum(
+            p.numel()
+            for m in student_pipeline.unet.attn_processors.values()
+            for p in m.parameters()
+        )
+        logger.info(f"LoRA parameters: {lora_params:,}")
 
     # ------------------------------------------------------------------ #
-    # Reward function  (built from rewards.py)
+    # Reward function  (built AFTER accelerator.prepare so device is
+    # correctly set per rank — avoids both processes loading onto GPU 0)
     # ------------------------------------------------------------------ #
-    # composite_reward_fn(student_images, teacher_images, prompts)
-    #   → (total: list[float],  details: dict[str, list[float]])
+    accelerator.wait_for_everyone()
     reward_fn = get_reward_fn(reward_types, teacher_pipeline, student_pipeline)
 
     # ------------------------------------------------------------------ #
@@ -305,18 +323,32 @@ def main(_):
         logger.info(f"Epoch {epoch}: Sampling + Training")
 
         # ---- Prompt batch ------------------------------------------------
-        if FLAGS.prompt_source == "coco" and coco_captions:
-            if len(coco_captions) >= config.sample.batch_size:
-                prompts = random.sample(coco_captions, k=config.sample.batch_size)
+        # IMPORTANT: sample prompts only on rank 0, then broadcast to all ranks.
+        # Every GPU must run the same prompts so that accelerator.gather(rewards)
+        # aggregates comparable values and the advantage slice-back is correct.
+        if accelerator.is_main_process:
+            if FLAGS.prompt_source == "coco" and coco_captions:
+                if len(coco_captions) >= config.sample.batch_size:
+                    prompts = random.sample(coco_captions, k=config.sample.batch_size)
+                else:
+                    prompts = [
+                        random.choice(coco_captions)
+                        for _ in range(config.sample.batch_size)
+                    ]
             else:
-                prompts = [
-                    random.choice(coco_captions)
-                    for _ in range(config.sample.batch_size)
-                ]
+                pairs   = [prompt_fn(**config.prompt_fn_kwargs)
+                           for _ in range(config.sample.batch_size)]
+                prompts = [p[0] for p in pairs]
         else:
-            pairs   = [prompt_fn(**config.prompt_fn_kwargs)
-                       for _ in range(config.sample.batch_size)]
-            prompts = [p[0] for p in pairs]
+            prompts = [None] * config.sample.batch_size
+
+        # Broadcast the list of strings from rank 0 to all other ranks.
+        # broadcast_object_list requires torch.distributed to be initialised,
+        # which Accelerate does automatically in multi-GPU mode.
+        if accelerator.num_processes > 1:
+            prompt_container = [prompts]
+            torch.distributed.broadcast_object_list(prompt_container, src=0)
+            prompts = prompt_container[0]
 
         # ---- Encode prompts ----------------------------------------------
         prompt_ids = student_pipeline.tokenizer(
@@ -387,13 +419,21 @@ def main(_):
 
         rewards = rewards_to_tensor(rewards_raw, accelerator.device)  # (B,)
 
+        # Gather rewards from all GPUs before normalising advantages
+        rewards = accelerator.gather(rewards)                          # (B * num_gpus,)
+
         # Normalised, clamped advantages
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         advantages = torch.clamp(
             advantages,
             -config.train.adv_clip_max,
              config.train.adv_clip_max,
-        )  # (B,)
+        )  # (B * num_gpus,)
+
+        # Slice back to this rank's local batch
+        local_bs   = config.sample.batch_size
+        rank       = accelerator.process_index
+        advantages = advantages[rank * local_bs : (rank + 1) * local_bs]  # (B,)
 
         # ---------------------------------------------------------------- #
         # Latent KL regularisation
@@ -464,24 +504,25 @@ def main(_):
         all_rewards.append(reward_mean)
         all_rewards_std.append(reward_std)
 
-        detail_str = "  ".join(
-            f"{k}={float(np.mean(v)):.4f}" for k, v in reward_details.items()
-        )
-        print(
-            f"Epoch {epoch:4d} | reward {reward_mean:+.4f} ± {reward_std:.4f} "
-            f"| kl {kl_reg.item():.4f} | loss {total_loss_val:.6f}"
-            + (f"  [{detail_str}]" if detail_str else "")
-        )
-
-        with open(stats_file, "a") as f:
-            f.write(
-                f"Epoch {epoch}: loss={total_loss_val:.6f}, "
-                f"reward={reward_mean:.6f}±{reward_std:.6f}, "
-                f"kl={kl_reg.item():.6f}"
+        if accelerator.is_main_process:
+            detail_str = "  ".join(
+                f"{k}={float(np.mean(v)):.4f}" for k, v in reward_details.items()
             )
-            for k, v in reward_details.items():
-                f.write(f", {k}={float(np.mean(v)):.6f}")
-            f.write("\n")
+            print(
+                f"Epoch {epoch:4d} | reward {reward_mean:+.4f} ± {reward_std:.4f} "
+                f"| kl {kl_reg.item():.4f} | loss {total_loss_val:.6f}"
+                + (f"  [{detail_str}]" if detail_str else "")
+            )
+
+            with open(stats_file, "a") as f:
+                f.write(
+                    f"Epoch {epoch}: loss={total_loss_val:.6f}, "
+                    f"reward={reward_mean:.6f}±{reward_std:.6f}, "
+                    f"kl={kl_reg.item():.6f}"
+                )
+                for k, v in reward_details.items():
+                    f.write(f", {k}={float(np.mean(v)):.6f}")
+                f.write("\n")
 
         if accelerator.is_main_process:
             log_dict = {
@@ -526,34 +567,36 @@ def main(_):
             save_side_by_side(student_eval, teacher_eval, epoch, outdir)
 
     # ------------------------------------------------------------------ #
-    # Save model & training curves
+    # Save model & training curves  (main process only)
     # ------------------------------------------------------------------ #
-    student_pipeline.save_pretrained(os.path.join(stats_dir, "student_model"))
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        student_pipeline.save_pretrained(os.path.join(stats_dir, "student_model"))
 
-    epochs = range(len(all_losses))
+        epochs = range(len(all_losses))
 
-    plt.figure()
-    plt.plot(epochs, all_losses, label="Total loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training Loss")
-    plt.legend()
-    plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
-    plt.close()
+        plt.figure()
+        plt.plot(epochs, all_losses, label="Total loss")
+        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training Loss")
+        plt.legend()
+        plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
+        plt.close()
 
-    all_rewards    = np.array(all_rewards)
-    all_rewards_std = np.array(all_rewards_std)
-    plt.figure()
-    plt.plot(epochs, all_rewards, label=f"Reward ({'+'.join(reward_types)})")
-    plt.fill_between(
-        epochs,
-        all_rewards - all_rewards_std,
-        all_rewards + all_rewards_std,
-        alpha=0.3, label="± std",
-    )
-    plt.xlabel("Epoch"); plt.ylabel("Reward")
-    plt.title(f"Reward Curve (student ↔ teacher)  [{'+'.join(reward_types)}]")
-    plt.legend()
-    plt.savefig(os.path.join(stats_dir, "reward_curve.png"))
-    plt.close()
+        all_rewards    = np.array(all_rewards)
+        all_rewards_std = np.array(all_rewards_std)
+        plt.figure()
+        plt.plot(epochs, all_rewards, label=f"Reward ({'+'.join(reward_types)})")
+        plt.fill_between(
+            epochs,
+            all_rewards - all_rewards_std,
+            all_rewards + all_rewards_std,
+            alpha=0.3, label="± std",
+        )
+        plt.xlabel("Epoch"); plt.ylabel("Reward")
+        plt.title(f"Reward Curve (student ↔ teacher)  [{'+'.join(reward_types)}]")
+        plt.legend()
+        plt.savefig(os.path.join(stats_dir, "reward_curve.png"))
+        plt.close()
 
 
 if __name__ == "__main__":

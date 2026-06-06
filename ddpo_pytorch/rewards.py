@@ -12,7 +12,7 @@ Reward types
 "text_image"  – CLIP image-text alignment                 (student image ↔ prompt)
 "aesthetic"   – LAION aesthetic score                     (student image only)
 "mse"         – negative MSE between student and teacher  (student ↔ teacher)
-               This is the diffusion reconstruction loss turned into a reward:
+               This qis the diffusion reconstruction loss turned into a reward:
                reward = -MSE(student_pixels, teacher_pixels)
                A less negative (higher) reward means the student image is
                closer to the teacher image in pixel space, identical to the
@@ -20,6 +20,7 @@ Reward types
 """
 
 import io
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -144,11 +145,15 @@ class CLIPSimilarity:
     _MEAN = [0.48145466, 0.4578275,  0.40821073]
     _STD  = [0.26862954, 0.26130258, 0.27577711]
 
-    def __init__(self, device="cuda"):
+    def __init__(self, device=None):
+        # Use the correct per-rank GPU; never default to bare "cuda" in multi-GPU runs
+        if device is None:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{local_rank}")
         self.device = device
         self.model = CLIPModel.from_pretrained(
             "openai/clip-vit-base-patch32"
-        ).to(device).eval()
+        ).to(self.device).eval()
         self.model.requires_grad_(False)
 
     def encode_images(self, images) -> torch.Tensor:
@@ -187,7 +192,8 @@ def clip_text_image_alignment_reward_fn(student_pipeline):
     Measures how well the STUDENT image matches the text prompt.
     Does NOT compare to teacher; useful as an auxiliary signal.
     """
-    device = student_pipeline.device
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else student_pipeline.device
     model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
     model.requires_grad_(False)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
