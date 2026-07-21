@@ -31,6 +31,7 @@ from ddpo_pytorch.rewards import get_reward_fn
 import ddpo_pytorch.prompts
 from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
+import ddpo_pytorch.flop_budget
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 logger = get_logger(__name__)
@@ -41,6 +42,12 @@ config_flags.DEFINE_config_file("config", "config/distill_clip.py", "Training co
 flags.DEFINE_enum("prompt_source", "coco", ["default", "coco"], "Prompt source")
 flags.DEFINE_enum("coco_split", "train", ["train", "val", "both"], "COCO caption split")
 flags.DEFINE_string("coco_annotations_dir", "coco_dataset/annotations", "COCO annotations directory")
+flags.DEFINE_string(
+    "reference_config", "config/distill_clip.py",
+    "Config file for scripts/train_ppo_coco.py's run - used ONLY to compute "
+    "the FLOP budget this baseline should match, not to change this "
+    "baseline's own hyperparameters."
+)
 
 
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
@@ -245,10 +252,15 @@ def main(_):
             if name.startswith("mid_block"):
                 hidden_size = student_pipeline.unet.config.block_out_channels[-1]
             elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
+                # --- FIX: name[len("up_blocks.")] indexes a single character
+                # at a fixed offset, which only happened to equal the block
+                # digit because SD1.5 has < 10 blocks per side. Parse the
+                # actual "up_blocks.N...." segment instead, matching the
+                # robust version used in the other baselines. ---
+                block_id = int(name[len("up_blocks."):].split(".")[0])
                 hidden_size = list(reversed(student_pipeline.unet.config.block_out_channels))[block_id]
             elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
+                block_id = int(name[len("down_blocks."):].split(".")[0])
                 hidden_size = student_pipeline.unet.config.block_out_channels[block_id]
             lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
         student_pipeline.unet.set_attn_processor(lora_attn_procs)
@@ -270,11 +282,65 @@ def main(_):
     )
     unet, optimizer = accelerator.prepare(unet, optimizer)
 
-    # EMA
-    ema_unet = copy.deepcopy(unet)
-    for p in ema_unet.parameters():
-        p.requires_grad = False
+    # ------------------------------------------------------------
+    # EMA target network
+    # ------------------------------------------------------------
+    # --- FIX (critical): `copy.deepcopy(unet)` when use_lora=True deep-copies
+    # the `_Wrapper(AttnProcsLayers)` object, which DOES get its own
+    # independent LoRA parameter tensors - but `_Wrapper.forward()` is
+    # hard-coded to call `student_pipeline.unet(*args, **kwargs)` via closure,
+    # completely ignoring `self`. That means calling the deep-copied
+    # `ema_unet(...)` executes the SAME live, currently-training student
+    # weights as calling `unet(...)` - `update_ema()` was faithfully
+    # maintaining an EMA buffer, but that buffer was never actually consulted
+    # to compute `ema_out`, silently defeating the entire point of using an
+    # EMA target for consistency-distillation stability. Fixed by cloning the
+    # actual underlying UNet2DConditionModel (base weights + LoRA attention
+    # processors together, since that is what the forward pass really
+    # computes) into a standalone module whose OWN forward is called. ---
+    ema_full_unet = copy.deepcopy(accelerator.unwrap_model(student_pipeline.unet))
+    for p in ema_full_unet.parameters():
+        p.requires_grad_(False)
+    ema_full_unet.to(accelerator.device)
     ema_decay = getattr(config.train, "ema_decay", 0.9999)
+
+    def update_ema_full(ema_model, source_unet, decay):
+        with torch.no_grad():
+            src = dict(source_unet.named_parameters())
+            for name, ema_p in ema_model.named_parameters():
+                if name in src:
+                    ema_p.data.mul_(decay).add_(src[name].data.to(ema_p.device), alpha=1.0 - decay)
+
+    # ------------------------------------------------------------
+    # FLOP-matching: run as many epochs as it takes to spend the same total
+    # FLOPs as train_ppo_coco.py's configured run, instead of the fixed
+    # config.num_epochs. Per epoch this loop does: one teacher rollout
+    # (sample.num_steps forward calls, no_grad), one student "eval" rollout
+    # for logging only (student.num_steps forward calls, no_grad), and
+    # train.gradient_accumulation_steps inner iterations each doing one
+    # student forward+backward call plus two forward-only teacher-shaped
+    # calls (the single-step teacher call and the EMA-network call).
+    # ------------------------------------------------------------
+    calib_dtype = next(teacher_pipeline.unet.parameters()).dtype
+    cross_attn_dim = teacher_pipeline.unet.config.cross_attention_dim
+    teacher_flops = flop_budget.calibrate_unet_call(
+        teacher_pipeline.unet, config.sample.batch_size, cross_attn_dim,
+        device=accelerator.device, dtype=calib_dtype, backward=False,
+    )
+    student_flops = flop_budget.calibrate_unet_call(
+        accelerator.unwrap_model(student_pipeline.unet), config.sample.batch_size, cross_attn_dim,
+        device=accelerator.device, dtype=calib_dtype, backward=True,
+    )
+    ref_config = flop_budget.load_reference_config(FLAGS.reference_config)
+    target_flops = flop_budget.reference_budget_flops(ref_config, teacher_flops, student_flops)
+    flops_per_epoch = (
+        config.sample.num_steps * teacher_flops
+        + config.student.num_steps * teacher_flops
+        + config.train.gradient_accumulation_steps * (student_flops + 2 * teacher_flops)
+    )
+    matched_num_epochs = flop_budget.units_needed(target_flops, flops_per_epoch)
+    flop_budget.report(accelerator.print, target_flops, flops_per_epoch, "epoch", matched_num_epochs)
+    config.num_epochs = matched_num_epochs
 
     prompt_fn = getattr(ddpo_pytorch.prompts, config.prompt_fn)
 
@@ -432,7 +498,7 @@ def main(_):
                     )
                     
                     # 4c. Get EMA model's prediction from x_{t_n} at time t_n
-                    ema_out = ema_unet(x_t_n.to(prompt_embeds.dtype), t_n, prompt_embeds).sample
+                    ema_out = ema_full_unet(x_t_n.to(prompt_embeds.dtype), t_n, encoder_hidden_states=prompt_embeds).sample
                     pred_x0_ema = compute_pred_original_sample(
                         student_pipeline.scheduler, ema_out, t_n, x_t_n, 
                         detach=True # No gradient for target
@@ -454,7 +520,7 @@ def main(_):
                 optimizer.zero_grad()
                 
                 # 7. Update EMA model
-                update_ema(ema_unet, unet, ema_decay)
+                update_ema_full(ema_full_unet, accelerator.unwrap_model(student_pipeline.unet), ema_decay)
 
                 total_loss += cd_loss.detach().cpu().item()
 

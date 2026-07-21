@@ -31,6 +31,7 @@ from PIL import Image
 import torch.nn.functional as F
 import math
 import torch.nn as nn
+import ddpo_pytorch.flop_budget
 
 # -------------------------
 # Flags and config
@@ -49,6 +50,12 @@ flags.DEFINE_enum(
 flags.DEFINE_string(
     "coco_annotations_dir", "coco_dataset/annotations",
     "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
+)
+flags.DEFINE_string(
+    "reference_config", "config/distill_clip.py",
+    "Config file for scripts/train_ppo_coco.py's run - used ONLY to compute "
+    "the FLOP budget this baseline should match, not to change this "
+    "baseline's own hyperparameters."
 )
 
 import tqdm as tqdm_lib
@@ -351,7 +358,46 @@ def main(_):
 
     # Distillation hyperparams
     steps_list = getattr(config.distill, "steps_list", [50, 25, 12, 5])
-    updates_per_stage = getattr(config.train, "distill_updates_per_stage", 10)
+
+    # ------------------------------------------------------------
+    # FLOP-matching: derive updates_per_stage from train_ppo_coco.py's
+    # compute budget. Per update this loop does: one teacher rollout
+    # (teacher_steps forward calls, no_grad) + 2 extra single-step teacher
+    # calls (no_grad, for the two-step DDIM target), one student
+    # forward+backward call, and two small-discriminator forward+backward
+    # calls (one for the disc update, one for the generator's adversarial
+    # term).
+    # ------------------------------------------------------------
+    calib_dtype = next(teacher_pipeline.unet.parameters()).dtype
+    cross_attn_dim = teacher_pipeline.unet.config.cross_attention_dim
+    teacher_flops = flop_budget.calibrate_unet_call(
+        teacher_unet, batch_size, cross_attn_dim, device=accelerator.device, dtype=calib_dtype, backward=False,
+    )
+    student_flops = flop_budget.calibrate_unet_call(
+        accelerator.unwrap_model(student_unet), batch_size, cross_attn_dim,
+        device=accelerator.device, dtype=calib_dtype, backward=True,
+    )
+    unwrapped_disc = accelerator.unwrap_model(disc)
+    cond_dim = getattr(student_pipeline.text_encoder.config, "hidden_size", 768)
+    def disc_inputs():
+        return (
+            torch.randn(batch_size, 4, 64, 64, device=accelerator.device, dtype=calib_dtype, requires_grad=True),
+            torch.randn(batch_size, 77, cond_dim, device=accelerator.device, dtype=calib_dtype),
+        )
+    disc_flops = flop_budget.calibrate_call(unwrapped_disc, disc_inputs, backward=True)
+
+    ref_config = flop_budget.load_reference_config(FLAGS.reference_config)
+    target_flops = flop_budget.reference_budget_flops(ref_config, teacher_flops, student_flops)
+    per_stage_budget = target_flops / len(steps_list)
+
+    updates_per_stage_list = []
+    for _student_steps in steps_list:
+        flops_per_update = (teacher_steps + 2) * teacher_flops + student_flops + 2 * disc_flops
+        updates_per_stage_list.append(flop_budget.units_needed(per_stage_budget, flops_per_update))
+    accelerator.print(
+        f"[flop-match] target = {target_flops:.4e} FLOPs (train_ppo_coco.py's configured run); "
+        f"updates per stage: {updates_per_stage_list}"
+    )
     batch_size = config.sample.batch_size
     guidance_scale = getattr(config.sample, "guidance_scale", 1.0)
     teacher_steps = getattr(config.sample, "num_steps", 50)
@@ -378,6 +424,17 @@ def main(_):
                 copied += 1
         print(f"Copied {copied} matching parameters from teacher -> student")
 
+        # --- FIX: zero the LoRA adapter for the new stage. Without this, a
+        # LoRA-restricted optimizer keeps accumulating updates from the
+        # previous stage on top of base weights that have now changed
+        # underneath it (they were just overwritten above), which is not the
+        # "start each stage from teacher + fresh adapter" scheme the
+        # progressive setup is supposed to implement. ---
+        if getattr(config, "use_lora", False):
+            for param in unet.parameters():
+                param.data.zero_()
+            print("Reset student LoRA parameters for new stage.")
+
         # Train student_unet (unet wrapper trains attn procs / LoRA if used)
         student_unet.train()
         # re-init discriminator at stage start (optional per paper)
@@ -390,6 +447,7 @@ def main(_):
 
         bce_loss = nn.BCEWithLogitsLoss()
 
+        updates_per_stage = updates_per_stage_list[stage_idx]
         pbar = tqdm(range(updates_per_stage), desc=f"Stage {stage_idx+1} updates", disable=not accelerator.is_main_process)
         updates_done = 0
         while updates_done < updates_per_stage:
@@ -521,6 +579,19 @@ def main(_):
         pbar.close()
         print(f"Finished distillation stage for student_steps={student_steps}. Updates done = {updates_done}")
 
+        # --- FIX: merge LoRA into the student's base weights before reading
+        # its state_dict for promotion. Without fuse_lora()/unfuse_lora(),
+        # copying by key name is a silent no-op whenever use_lora=True (see
+        # the equivalent fix in progressive_ppo.py / train_progressive.py):
+        # LoRA's up/down matrices live under keys like
+        # "...processor.to_q_lora.down.weight" that never match the plain
+        # teacher UNet's "...to_q.weight" keys, so none of the LoRA-learned
+        # deltas were actually reaching the teacher. ---
+        use_lora = getattr(config, "use_lora", False)
+        if use_lora:
+            student_unet.eval()
+            student_pipeline.fuse_lora()
+
         # Promote student -> teacher (copy student weights into teacher)
         new_teacher_state = teacher_unet.state_dict()
         student_state = student_unet.state_dict()
@@ -529,6 +600,11 @@ def main(_):
             if k in new_teacher_state and student_state[k].size() == new_teacher_state[k].size():
                 new_teacher_state[k].copy_(student_state[k].to(new_teacher_state[k].device))
                 copied2 += 1
+
+        if use_lora:
+            student_pipeline.unfuse_lora()
+            student_unet.train()
+
         print(f"Promoted student -> teacher by copying {copied2} params")
 
         # Save student pipeline checkpoint for this stage

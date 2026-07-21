@@ -18,7 +18,7 @@ def get_config():
 
     ###### General ######
     config.run_name = ""
-    config.seed = 44
+    config.seed = 24
     config.logdir = "logs"
     config.num_epochs = 20
     config.save_freq = 5             # epochs between accelerator.save_state() checkpoints
@@ -64,7 +64,7 @@ def get_config():
     # with `student.num_steps` - see scripts/train_ppo_coco.py for the exact
     # relationship. Kept >= 1; do not set independently without re-reading
     # that section.
-    sample.num_batches_per_epoch = 4
+    sample.num_batches_per_epoch = 1
 
     # Whether teacher and student must start each rollout from the same
     # initial latent noise. This MUST be True for ReDiF distillation to be
@@ -78,7 +78,7 @@ def get_config():
     config.train = train = ml_collections.ConfigDict()
     train.batch_size = 8             # must divide sample.batch_size * num_batches_per_epoch
     train.use_8bit_adam = False
-    train.learning_rate = 1e-4
+    train.learning_rate = 3e-4
     train.adam_beta1 = 0.9
     train.adam_beta2 = 0.999
     train.adam_weight_decay = 1e-4
@@ -95,7 +95,7 @@ def get_config():
     train.num_inner_epochs = 1
     train.cfg = True
     train.adv_clip_max = 5.0
-    train.clip_range = 1e-2          # PPO importance-ratio clip range (DDPO default)
+    train.clip_range = 1e-4          # PPO importance-ratio clip range (DDPO default)
     train.timestep_fraction = 1.0    # fraction of student.num_steps trained on per inner epoch
     # Weight of the analytic latent-space KL(student || teacher) regularizer
     # added to the PPO loss. 0 disables it.

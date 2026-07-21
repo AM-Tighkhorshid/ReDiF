@@ -22,6 +22,7 @@ import ddpo_pytorch.prompts
 from ddpo_pytorch.stat_tracking import PerPromptStatTracker
 from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
+from ddpo_pytorch import flop_budget
 import torch
 import wandb
 from functools import partial
@@ -32,6 +33,7 @@ import cv2
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torch.nn as nn
+from ddpo_pytorch.flop_budget import safe_get
 
 def save_side_by_side(student_images, teacher_images, epoch, outdir):
     os.makedirs(outdir, exist_ok=True)
@@ -81,6 +83,12 @@ flags.DEFINE_enum(
 flags.DEFINE_string(
     "coco_annotations_dir", "coco_dataset/annotations",
     "Path to COCO annotations directory (should contain captions_train2017.json and/or captions_val2017.json)"
+)
+flags.DEFINE_string(
+    "reference_config", "config/distill_clip.py",
+    "Config file for scripts/train_ppo_coco.py's run - used ONLY to compute "
+    "the FLOP budget this baseline should match, not to change this "
+    "baseline's own hyperparameters."
 )
 
 logger = get_logger(__name__)
@@ -329,7 +337,7 @@ def main(_):
     # Dry-forward a tiny tensor to determine mid feature channels if possible
     disc = None
     disc_optimizer = None
-    if getattr(config.gan, "use_gan", True):
+    if safe_get(config, "gan", "use_gan", True):
         try:
             dummy_bs = 1
             height = getattr(config.sample, "height", 512)
@@ -343,7 +351,7 @@ def main(_):
             mid_feat = mid_feat_store.get("feat", None)
             if mid_feat is not None:
                 mid_ch = mid_feat.shape[1]
-                disc = BottleneckDisc(in_channels=mid_ch, hidden_channels=getattr(config.gan, "disc_hidden", 128)).to(accelerator.device)
+                disc = BottleneckDisc(in_channels=mid_ch, hidden_channels=safe_get(config, "gan", "disc_hidden", 128)).to(accelerator.device)
                 disc_optimizer = torch.optim.AdamW(disc.parameters(), lr=getattr(config.train, "disc_lr", 1e-4), betas=(0.5, 0.9))
             else:
                 logger.warning("mid-block hook did not capture features; disabling discriminator.")
@@ -361,11 +369,68 @@ def main(_):
         disc, disc_optimizer = accelerator.prepare(disc, disc_optimizer)
 
     # Training hyperparams
-    num_epochs = config.num_epochs
     bs = config.sample.batch_size
     fake_updates = getattr(config.train, "fake_updates_per_gen", 5)
-    gan_weight = getattr(config.gan, "weight", 1.0)
-    use_gan = getattr(config.gan, "use_gan", False) and (disc is not None)
+    gan_weight = safe_get(config, "gan", "weight", 1.0)
+    use_gan = safe_get(config, "gan", "use_gan", False) and (disc is not None)
+
+    # ------------------------------------------------------------
+    # FLOP-matching: DMD2 does far more compute per epoch than plain PPO
+    # (an extra full auxiliary UNet `mu_fake` trained `fake_updates` times,
+    # plus a discriminator, plus a second/third generator-side UNet call),
+    # so matching *epoch counts* across baselines would NOT match compute.
+    # Calibrate every distinct call site this loop actually uses and derive
+    # num_epochs from the same total-FLOP target as train_ppo_coco.py.
+    # ------------------------------------------------------------
+    cross_attn_dim = teacher_pipeline.unet.config.cross_attention_dim
+    teacher_flops = flop_budget.calibrate_unet_call(
+        teacher_pipeline.unet, bs, cross_attn_dim, device=accelerator.device, dtype=dtype, backward=False,
+    )
+    student_flops = flop_budget.calibrate_unet_call(
+        accelerator.unwrap_model(student_pipeline.unet), bs, cross_attn_dim,
+        device=accelerator.device, dtype=dtype, backward=True,
+    )
+    mu_fake_flops = flop_budget.calibrate_unet_call(
+        accelerator.unwrap_model(mu_fake), bs, cross_attn_dim, device=accelerator.device, dtype=dtype, backward=True,
+    )
+    disc_flops = 0.0
+    if use_gan:
+        mid_ch = disc.net[0].in_channels if hasattr(disc, "net") else None
+        try:
+            unwrapped_disc = accelerator.unwrap_model(disc)
+            in_ch = unwrapped_disc.net[0].in_channels
+            def disc_inputs():
+                return (torch.randn(bs, in_ch, 8, 8, device=accelerator.device, dtype=dtype, requires_grad=True),)
+            disc_flops = flop_budget.calibrate_call(unwrapped_disc, disc_inputs, backward=True)
+        except Exception as e:
+            logger.warning(f"[flop-match] could not calibrate discriminator, treating its cost as 0: {e}")
+
+    ref_config = flop_budget.load_reference_config(FLAGS.reference_config)
+    target_flops = flop_budget.reference_budget_flops(ref_config, teacher_flops, student_flops)
+
+    # Per-epoch call count for THIS script:
+    #   - 1 teacher rollout (sample.num_steps, no_grad) + 1 student rollout
+    #     (student.num_steps, no_grad)                      -> teacher-cost class
+    #   - 1 extra single-step teacher call (no_grad)          -> teacher-cost class
+    #   - `fake_updates` mu_fake forward+backward calls
+    #   - (if GAN) 2 extra no_grad student forward calls for disc features,
+    #     1 disc forward+backward for the disc update, 1 more no_grad student
+    #     forward + 1 disc forward (no grad into disc, but counted at its
+    #     forward+backward calibration for a conservative/simple estimate)
+    #     for the generator's adversarial term
+    #   - 1 student forward+backward for the generator update
+    rollout_calls = config.sample.num_steps + config.student.num_steps + 1
+    gan_student_fwd_calls = 3 if use_gan else 0  # no_grad student calls used only to read mid features
+    flops_per_epoch = (
+        rollout_calls * teacher_flops
+        + gan_student_fwd_calls * teacher_flops
+        + fake_updates * mu_fake_flops
+        + (2 * disc_flops if use_gan else 0.0)
+        + student_flops
+    )
+    matched_num_epochs = flop_budget.units_needed(target_flops, flops_per_epoch)
+    flop_budget.report(accelerator.print, target_flops, flops_per_epoch, "epoch", matched_num_epochs)
+    num_epochs = matched_num_epochs
 
     logger.info("Beginning DMD2 training loop")
 
@@ -553,9 +618,21 @@ def main(_):
                 noisy_for_gen = alpha_sqrt * pred_x0 + sigma_sqrt * noise
 
 
-            # mu_fake prediction (train mode for gradient path)
+            # mu_fake prediction (train mode for gradient path). We need
+            # gradients to flow BACK THROUGH mu_fake's activations into the
+            # generator's parameters (that's how the DMD loss trains the
+            # generator), but mu_fake's OWN parameters should not receive or
+            # accumulate gradients here - only `fake_optimizer` is allowed to
+            # update them, in the earlier "Update mu_fake" block above. Toggle
+            # requires_grad off/back-on around this single call instead of
+            # `torch.no_grad()` (which would also block the gradient the
+            # generator needs).
             mu_fake.train()
+            for p in mu_fake.parameters():
+                p.requires_grad_(False)
             mu_pred_for_gen = mu_fake(noisy_for_gen, timesteps, encoder_hidden_states=prompt_embeds).sample
+            for p in mu_fake.parameters():
+                p.requires_grad_(True)
 
             # Distribution matching loss (MSE between teacher_pred and mu_pred_for_gen)
             dmd_loss = F.mse_loss(mu_pred_for_gen, teacher_pred.detach())
