@@ -406,7 +406,7 @@ def main(_):
                 )
 
         reward_tag = "_".join(reward_types)
-        outdir = f"Results7/PPO_{reward_tag}_kl{config.train.kl_coef}"
+        outdir = f"Results_KL/PPO_{reward_tag}_kl{config.train.kl_coef}"
         outdir += "_coco" if FLAGS.prompt_source == "coco" else "_default"
         outdir += f"_batch_size_{config.sample.batch_size}"
         outdir += f"_lr_{config.train.learning_rate}"
