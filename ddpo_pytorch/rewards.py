@@ -16,13 +16,37 @@ Reward types
                 implementation lives in `ddpo_pytorch/clip_distill.py`.
 "dino"        - DINOv3 patch-token cosine similarity (student <-> teacher).
                 Backed by timm's `vit_base_patch16_dinov3.lvd1689m` checkpoint.
-"perception"  - negative LPIPS perceptual distance (student <-> teacher).
+"perception"  - Meta Perception Encoder (PE) image-image cosine similarity
+                (student <-> teacher). NOTE: "Perception Encoder" is NOT the
+                same model family as LPIPS (see the "lpips" vs "perception"
+                note below) - PE is a large-scale CLIP-style contrastive
+                vision(-language) encoder (arXiv:2504.13181, Meta, Apr 2025),
+                loaded here via timm's `vit_pe_core_base_patch16_224.fb`
+                checkpoint. It measures similarity in a general-purpose
+                semantic embedding space, not a human-perceptual-similarity-
+                calibrated one.
+"lpips"       - negative LPIPS perceptual distance (student <-> teacher).
+                This is the metric that was previously (mis-)labeled
+                "perception" in this file - LPIPS ("Learned Perceptual Image
+                Patch Similarity") is a distance calibrated to match human
+                judgments of patch similarity using a fixed, frozen backbone
+                (VGG here), which is a different model family and a
+                different training objective from Perception Encoder above.
+                Kept as its own reward type since the two capture different
+                notions of "similarity" and are not interchangeable.
 "text_image"  - CLIP image-text alignment (student image <-> prompt).
 "aesthetic"   - LAION aesthetic score (student image only).
 "mse"         - negative pixel-space MSE (student <-> teacher):
                     reward = -MSE(student_pixels, teacher_pixels)
                 A less-negative (higher) reward means the student image is
                 closer to the teacher image in pixel space.
+"kl"          - negative KL divergence between per-channel pixel-intensity
+                histograms of the student and teacher images:
+                    reward = -KL(P_teacher || P_student)
+                See `kl_divergence_reward_fn` docstring for the exact
+                histogram construction, bin count, and why the *forward* KL
+                (teacher as reference distribution) is used here rather than
+                the reverse KL.
 
 Notes on why every encoder call below is wrapped in `torch.no_grad()`
 ----------------------------------------------------------------------
@@ -31,13 +55,13 @@ term in the loss. The student is updated purely through the policy-gradient
 term (importance ratio x advantage), computed from
 `log_prob(next_latent | latent)` in the PPO training loop - never by
 back-propagating through a reward model. Every reward encoder here (CLIP,
-DINOv3, LPIPS, the aesthetic scorer) is loaded frozen and run under
-`torch.no_grad()` for that reason. If you ever want a *differentiable*
-distillation term (e.g. an auxiliary feature-matching loss added directly to
-the PPO loss instead of used as a reward), that must be implemented
-separately in the training script with the encoder's gradients allowed to
-flow into the student's log-prob term's inputs - it should NOT be bolted
-onto these reward functions.
+DINOv3, Perception Encoder, LPIPS, the aesthetic scorer) is loaded frozen and
+run under `torch.no_grad()` for that reason. If you ever want a
+*differentiable* distillation term (e.g. an auxiliary feature-matching loss
+added directly to the PPO loss instead of used as a reward), that must be
+implemented separately in the training script with the encoder's gradients
+allowed to flow into the student's log-prob term's inputs - it should NOT be
+bolted onto these reward functions.
 """
 
 import os
@@ -95,7 +119,8 @@ def _pil_or_tensor_to_tensor(images, size: int, mean, std, device) -> torch.Tens
 def _to_float_tensor(images, device) -> torch.Tensor:
     """
     Convert images to a (B,C,H,W) float32 tensor in [0,1] on `device`,
-    WITHOUT any normalization. Used for pixel-space MSE.
+    WITHOUT any normalization. Used for pixel-space MSE and for the
+    histogram-based KL reward.
     """
     if isinstance(images, (list, tuple)) and isinstance(images[0], Image.Image):
         t = Compose([ToTensor()])
@@ -130,6 +155,103 @@ def mse_reconstruction_reward_fn(teacher_pipeline, student_pipeline):
             reward = -mse_per_sample
 
         info = {"mse": mse_per_sample.tolist(), "rmse": mse_per_sample.sqrt().tolist()}
+        return reward.tolist(), info
+
+    return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# KL-divergence reconstruction reward
+# ---------------------------------------------------------------------------
+
+def _batched_channel_histogram(images: torch.Tensor, n_bins: int, value_range=(0.0, 1.0)) -> torch.Tensor:
+    """
+    Vectorized per-image, per-channel intensity histogram.
+
+    images : (B, C, H, W) float tensor with values in `value_range`.
+    Returns: (B, C, n_bins) tensor of raw (unnormalized) bin counts.
+
+    Implemented with `scatter_add_` instead of a per-sample `torch.histc`
+    loop - `torch.histc` only supports a single flat tensor per call (no
+    batch dimension), so a Python-level loop over B*C histograms would be
+    both slow and awkward to keep on-device across a whole rollout batch.
+    """
+    B, C, H, W = images.shape
+    lo, hi = value_range
+    bin_width = (hi - lo) / n_bins
+    # clamp so a pixel exactly at `hi` still lands in the last bin instead of
+    # overflowing to index n_bins
+    clamped = images.clamp(lo, hi - 1e-6)
+    bin_idx = ((clamped - lo) / bin_width).long().clamp(0, n_bins - 1)  # (B, C, H, W)
+    bin_idx = bin_idx.reshape(B, C, H * W)
+
+    counts = torch.zeros(B, C, n_bins, device=images.device, dtype=images.dtype)
+    counts.scatter_add_(dim=2, index=bin_idx, src=torch.ones_like(bin_idx, dtype=images.dtype))
+    return counts
+
+
+def kl_divergence_reward_fn(teacher_pipeline, student_pipeline, n_bins: int = 32, eps: float = 1e-6):
+    """
+    Negative KL divergence between student and teacher images, estimated
+    from per-channel pixel-intensity histograms:
+
+        reward = -KL(P_teacher || P_student)
+                = -sum_bins  P_teacher(bin) * log( P_teacher(bin) / P_student(bin) )
+
+    This is deliberately the SAME kind of cheap, no-encoder, purely
+    pixel-space signal as `mse_reconstruction_reward_fn` (as requested) - it
+    does not load any extra network, it just compares the two images'
+    intensity distributions directly. Two design choices worth being
+    explicit about:
+
+    1. Direction of the KL: this uses the *forward* KL, KL(teacher ||
+       student), i.e. the teacher's histogram is the reference ("true")
+       distribution and the student's is the approximation. This mirrors
+       the usual distillation convention (student approximates teacher) and
+       is mode-covering: it penalizes the student most heavily for having
+       near-zero probability mass in an intensity bin the teacher image
+       actually uses. The reverse KL(student || teacher) would instead most
+       heavily penalize the student for putting mass somewhere the teacher
+       doesn't - a different (mode-seeking) failure mode. Swap the two `_p`
+       tensors in the `kl_per_channel` line below if you want that instead.
+    2. Per-channel, not joint-RGB: histograms are computed independently
+       per color channel and the resulting per-channel KLs are summed. This
+       is a standard simplification (a full joint RGB histogram needs
+       exponentially more bins to stay statistically meaningful at typical
+       image resolutions) but it does mean this reward is blind to
+       cross-channel correlation and, like MSE, completely blind to spatial
+       structure - two images with identical per-channel intensity
+       histograms but totally different content would score a KL of ~0.
+       Use alongside "clip"/"dino"/"perception"/"lpips" if spatial/semantic
+       structure matters for your use case, not as a spatial-structure
+       reward on its own.
+
+    `eps` is Laplace-style smoothing added to every bin before normalizing,
+    so an empty student bin where the teacher has mass doesn't produce a
+    +inf KL from a single outlier pixel.
+    """
+    device = student_pipeline.device
+
+    def reward_fn(student_images, teacher_images, prompts=None):
+        s = _to_float_tensor(student_images, device)
+        t = _to_float_tensor(teacher_images, device)
+        if s.shape != t.shape:
+            t = F.interpolate(t, size=s.shape[2:], mode="bicubic", align_corners=False)
+
+        with torch.no_grad():
+            s_counts = _batched_channel_histogram(s, n_bins=n_bins)  # (B, C, n_bins)
+            t_counts = _batched_channel_histogram(t, n_bins=n_bins)
+
+            s_p = (s_counts + eps) / (s_counts.sum(dim=-1, keepdim=True) + eps * n_bins)
+            t_p = (t_counts + eps) / (t_counts.sum(dim=-1, keepdim=True) + eps * n_bins)
+
+            # KL(teacher || student), per (batch, channel), then summed over
+            # channels - see docstring point 1 for the direction rationale.
+            kl_per_channel = (t_p * (t_p.log() - s_p.log())).sum(dim=-1)  # (B, C)
+            kl_per_sample = kl_per_channel.sum(dim=-1)  # (B,)
+            reward = -kl_per_sample
+
+        info = {"kl": kl_per_sample.tolist()}
         return reward.tolist(), info
 
     return reward_fn
@@ -252,10 +374,103 @@ def dinov3_reward_fn(teacher_pipeline, student_pipeline):
 
 
 # ---------------------------------------------------------------------------
-# Perceptual (LPIPS) reward - lower LPIPS = better = higher reward
+# Perception Encoder (PE) image-image similarity reward
+#
+# NOT the same thing as LPIPS (see `lpips_reward_fn` below and the module
+# docstring). Perception Encoder (Bolya et al., "Perception Encoder: The
+# best visual embeddings are not at the output of the network",
+# arXiv:2504.13181, Meta, Apr 2025) is a family of large-scale CLIP-style
+# vision(-language) encoders trained with contrastive vision-language
+# learning, released via https://github.com/facebookresearch/perception_models
+# and integrated into timm (as of the `.fb`-suffixed `vit_pe_core_*`
+# checkpoints, timm >= ~1.0.16). It produces general-purpose semantic image
+# embeddings - closer in spirit to CLIP/DINO here than to LPIPS, which is a
+# small, fixed backbone (VGG/AlexNet/SqueezeNet) *calibrated specifically to
+# match human patch-similarity judgments* rather than trained for general
+# semantic retrieval/classification.
 # ---------------------------------------------------------------------------
 
-def perception_reward_fn(teacher_pipeline, student_pipeline):
+def perception_encoder_feature_extractor(device="cuda", model_name="vit_pe_core_base_patch16_224.fb"):
+    """Loads a Meta Perception Encoder (PE-Core) ViT via timm and returns an
+    encode() closure producing a single global (pooled) embedding per image.
+
+    Requires a recent timm build with PE support (`pip install -U timm`).
+    Other available sizes/resolutions include:
+        vit_pe_core_large_patch14_336.fb
+        vit_pe_core_gigantic_patch14_448.fb
+    """
+    import timm
+    from huggingface_hub import logout as _hf_logout
+
+    
+    os.environ.pop("HF_TOKEN", None)
+    os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+    os.environ.pop("HUGGINGFACE_HUB_TOKEN", None)
+
+    try:
+        _hf_logout()
+    except Exception:
+        pass
+
+    try:
+        # num_classes=0 drops the classifier head and returns the pooled
+        # embedding directly from model(imgs) - the PE-Core analogue of
+        # CLIP's `get_image_features`.
+        model = timm.create_model(model_name, pretrained=True, num_classes=0).to(device)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Could not load '{model_name}' ({e}). Perception Encoder entrypoints "
+            "were only added to timm relatively recently - try `pip install -U timm`."
+        ) from e
+    model.eval()
+    model.requires_grad_(False)
+
+    try:
+        data_cfg = timm.data.resolve_data_config({}, model=model)
+        mean = list(data_cfg.get("mean", (0.5, 0.5, 0.5)))
+        std = list(data_cfg.get("std", (0.5, 0.5, 0.5)))
+        size = data_cfg.get("input_size", (3, 224, 224))[-1]
+    except Exception:
+        # Fall back to PE-Core's documented normalization/resolution if
+        # timm's own config resolution fails for some reason.
+        mean, std, size = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 224
+
+    def encode(images):
+        imgs = _pil_or_tensor_to_tensor(images, size, mean, std, device)
+        with torch.no_grad():
+            embeds = model(imgs)  # (B, embed_dim) - already globally pooled
+        return F.normalize(embeds.float(), dim=-1)
+
+    return encode
+
+
+def perception_encoder_reward_fn(teacher_pipeline, student_pipeline):
+    device = student_pipeline.device
+    encode = perception_encoder_feature_extractor(device)
+
+    def reward_fn(student_images, teacher_images, prompts=None):
+        s_feats = encode(student_images)
+        t_feats = encode(teacher_images)
+        sims = F.cosine_similarity(s_feats, t_feats, dim=-1)
+        return sims.tolist(), None
+
+    def feature_fn(student_images, teacher_images):
+        return encode(student_images), encode(teacher_images)
+
+    reward_fn.feature_fn = feature_fn
+    return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# LPIPS perceptual-distance reward - lower LPIPS = better = higher reward
+#
+# This is the metric that lived under the name "perception" before; renamed
+# to "lpips" to avoid clashing with the actual Perception Encoder reward
+# above, since the two measure different things and neither is a substitute
+# for the other (see module docstring).
+# ---------------------------------------------------------------------------
+
+def lpips_reward_fn(teacher_pipeline, student_pipeline):
     import lpips
 
     device = student_pipeline.device
@@ -345,7 +560,10 @@ _REWARD_BUILDERS = {
     "dino": lambda teacher_pipeline, student_pipeline: dinov3_reward_fn(
         teacher_pipeline, student_pipeline
     ),
-    "perception": lambda teacher_pipeline, student_pipeline: perception_reward_fn(
+    "perception": lambda teacher_pipeline, student_pipeline: perception_encoder_reward_fn(
+        teacher_pipeline, student_pipeline
+    ),
+    "lpips": lambda teacher_pipeline, student_pipeline: lpips_reward_fn(
         teacher_pipeline, student_pipeline
     ),
     "text_image": lambda teacher_pipeline, student_pipeline: clip_text_image_alignment_reward_fn(
@@ -353,6 +571,9 @@ _REWARD_BUILDERS = {
     ),
     "aesthetic": lambda teacher_pipeline, student_pipeline: aesthetic_reward_fn(student_pipeline),
     "mse": lambda teacher_pipeline, student_pipeline: mse_reconstruction_reward_fn(
+        teacher_pipeline, student_pipeline
+    ),
+    "kl": lambda teacher_pipeline, student_pipeline: kl_divergence_reward_fn(
         teacher_pipeline, student_pipeline
     ),
 }

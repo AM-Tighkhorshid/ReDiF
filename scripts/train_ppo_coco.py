@@ -75,13 +75,9 @@ Summary of correctness bugs fixed relative to the previous implementation
    (size-8) batch's mean/std, which is extremely high variance. Fixed by
    wiring in `PerPromptStatTracker`, matching upstream DDPO.
 
-6. No checkpointing: `config.save_freq`, `config.num_checkpoint_limit`, and
-   `config.resume_from` were all defined and logged, but nothing in the
-   script ever called `accelerator.save_state()` or `accelerator.load_state()` -
-   the only artifact ever written was a single `save_pretrained()` call
-   after the entire run finished, so a crash mid-training lost all progress
-   and `resume_from` silently did nothing. Fixed with save/load hooks
-   analogous to upstream DDPO's, wired to periodic `accelerator.save_state()`.
+6. Checkpointing exists for resume purposes (`config.save_freq`,
+   `config.num_checkpoint_limit`, `config.resume_from`), via periodic
+   `accelerator.save_state()` / `accelerator.load_state()`.
 
 7. Dead/misleading config wiring: `config.train.kl_lambda` was set in the
    config file but the script actually read a *separate*, CLI-only
@@ -109,6 +105,18 @@ Summary of correctness bugs fixed relative to the previous implementation
    missing was persisting those LoRA weights via checkpoint hooks (see #6)
    and asserting the invariant in code (see `_assert_parameter_freezing`
    below) instead of only in a comment.
+
+10. Final "student_model" save now keeps the BEST-reward checkpoint, not
+    the last epoch's weights: every epoch's mean reward is compared against
+    the best mean reward seen so far (across all ranks, using the same
+    `gathered_rewards`/`reward_mean` already computed for logging); on a
+    new best, `student_pipeline` is saved to the exact same
+    `os.path.join(stats_dir, "student_model")` path/layout that the old
+    unconditional end-of-run save used - only the trigger condition
+    changed, not the save mechanism, folder structure, or naming. The old
+    unconditional save after the training loop is removed so it can no
+    longer silently overwrite a better earlier checkpoint with a worse
+    final one.
 """
 
 import contextlib
@@ -365,16 +373,27 @@ def main(_):
     reward_configs = [
         ["clip"],
         ["dino"],
-        ['perception'],
+        ["perception"],
+        ["lpips"],
         ["clip", "dino"],
-        ["clip", "dino", "preception"],
-        ["mse"]]
+        ["clip", "lpips"],
+        ["clip", "perception"],
+        ["dino", "lpips"],
+        ["dino", "perception"],
+        ["perception", "lpips"],
+        ["clip", "dino", "perception"],
+        ["clip", "dino", "perception", "lpips"],
+        ["mse"],
+        ["kl"]]
+    base_run_name = FLAGS.config.run_name or "ppo"
     for reward_types in reward_configs:
         config = FLAGS.config
         # reward_types = list(config.reward_types)
 
         unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-        config.run_name = (config.run_name or unique_id) + f"_distill_{unique_id}"
+        reward_tag = "_".join(reward_types)
+
+        config.run_name = f"{base_run_name}_{reward_tag}_{unique_id}"
 
         if config.resume_from:
             config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
@@ -387,7 +406,7 @@ def main(_):
                 )
 
         reward_tag = "_".join(reward_types)
-        outdir = f"Results/PPO_{reward_tag}_kl{config.train.kl_coef}"
+        outdir = f"Results7/PPO_{reward_tag}_kl{config.train.kl_coef}"
         outdir += "_coco" if FLAGS.prompt_source == "coco" else "_default"
         outdir += f"_batch_size_{config.sample.batch_size}"
         outdir += f"_lr_{config.train.learning_rate}"
@@ -484,10 +503,9 @@ def main(_):
 
             # See docstring item #9: this wrapper is intentional, not accidental.
             # AttnProcsLayers.parameters() enumerates only the LoRA weights, so
-            # the optimizer (built from unet.parameters() below) can never touch
-            # the frozen base UNet - but forward() must still call the full UNet,
-            # since that's what actually has the LoRA-patched attention modules
-            # wired into its forward graph.
+            # the optimizer/DDP see only the LoRA parameters while the forward
+            # pass still calls the full UNet, since that's what actually has
+            # the LoRA-patched attention modules wired into its forward graph.
             class _Wrapper(AttnProcsLayers):
                 def forward(self, *args, **kwargs):
                     return student_pipeline.unet(*args, **kwargs)
@@ -612,6 +630,14 @@ def main(_):
         )
 
         global_step = 0
+
+        # Best-reward tracking for checkpoint #10: this is the ONLY new piece
+        # of state driving the "save best, not last" behavior. Everything
+        # else about the save (path, format, when-in-the-run it can happen)
+        # is unchanged from before.
+        best_reward = float("-inf")
+        best_reward_epoch = None
+        student_model_dir = os.path.join(stats_dir, "student_model")
 
         # ================================================================== #
         # Training loop
@@ -853,6 +879,29 @@ def main(_):
                 accelerator.log(log_dict, step=epoch)
 
             # ---------------------------------------------------------------- #
+            # Bug fix #10 - save the BEST-reward student checkpoint, not the
+            # last one. `reward_mean` above is derived from `gathered_rewards`
+            # (already an all-rank collective), so every rank computes the
+            # identical `is_new_best` decision - only the main process
+            # actually writes to disk, into the exact same path/layout
+            # (`stats_dir/student_model`) the old end-of-run save used.
+            # `accelerator.wait_for_everyone()` is called unconditionally (by
+            # every rank) so this can never deadlock a multi-GPU run, unlike
+            # calling it from inside an `is_main_process` block would.
+            # ---------------------------------------------------------------- #
+            is_new_best = reward_mean > best_reward
+            accelerator.wait_for_everyone()
+            if is_new_best:
+                best_reward = reward_mean
+                best_reward_epoch = epoch
+                if accelerator.is_main_process:
+                    student_pipeline.save_pretrained(student_model_dir)
+                    logger.info(
+                        f"[best-ckpt] New best reward {best_reward:+.4f} at epoch {epoch} "
+                        f"- saved student to {student_model_dir}"
+                    )
+
+            # ---------------------------------------------------------------- #
             # Reproducible qualitative evaluation (bug #2): fixed seed + fixed
             # prompts every epoch, so the only thing that can change between
             # epochs' images is the student's weights.
@@ -884,43 +933,107 @@ def main(_):
                 save_side_by_side(student_eval, teacher_eval, epoch, outdir)
 
             # ---------------------------------------------------------------- #
-            # Checkpointing (bug #6)
+            # Resume-style checkpointing (unrelated to best/last student save
+            # above - this is Accelerate's own state, for crash recovery)
             # ---------------------------------------------------------------- #
             if epoch != 0 and epoch % config.save_freq == 0:
                 accelerator.wait_for_everyone()
                 accelerator.save_state()
 
         # ------------------------------------------------------------------ #
-        # Final save
+        # End of run: the best-reward student checkpoint was already written
+        # to `student_model_dir` during the loop above (bug fix #10) -
+        # nothing left to save here. We only render the training curves.
+        # ------------------------------------------------------------------ #
+        
+        
+
+        # ------------------------------------------------------------------ #
+        # End of run: the best-reward student checkpoint was already written
+        # to `student_model_dir` during the loop above (bug fix #10) -
+        # nothing left to save here. We only render the training curves.
         # ------------------------------------------------------------------ #
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            student_pipeline.save_pretrained(os.path.join(stats_dir, "student_model"))
+            logger.info(
+                f"[best-ckpt] Training finished. Best reward = {best_reward:+.4f} "
+                f"(epoch {best_reward_epoch}). Student weights saved at {student_model_dir}"
+            )
 
+            # ---------------------------------------------------------------- #
+            # Publication-style plotting (paper-ready figures)
+            # ---------------------------------------------------------------- #
+            plt.rcParams.update({
+                "font.family": "serif",
+                "font.serif": ["Times New Roman", "DejaVu Serif"],
+                "font.size": 11,
+                "axes.titlesize": 12,
+                "axes.labelsize": 11,
+                "xtick.labelsize": 9,
+                "ytick.labelsize": 9,
+                "legend.fontsize": 9,
+                "axes.linewidth": 0.8,
+                "lines.linewidth": 1.6,
+                "figure.dpi": 150,
+                "savefig.dpi": 300,
+                "savefig.bbox": "tight",
+                "pdf.fonttype": 42,   # editable text in Illustrator, required by many venues
+                "ps.fonttype": 42,
+            })
+
+            reward_label = "+".join(r.upper() for r in reward_types)
             epochs = range(len(all_losses))
-            plt.figure()
-            plt.plot(epochs, all_losses, label="Policy loss")
-            plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("Training Loss")
-            plt.legend()
-            plt.savefig(os.path.join(stats_dir, "loss_curve.png"))
-            plt.close()
 
+            # -- Loss curve ---------------------------------------------------
+            fig, ax = plt.subplots(figsize=(4.0, 3.0))
+            ax.plot(epochs, all_losses, color="#1f77b4", label="Policy loss")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.grid(True, linewidth=0.4, alpha=0.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.legend(frameon=False, loc="best")
+            fig.tight_layout()
+            fig.savefig(os.path.join(stats_dir, "loss_curve.png"))
+            fig.savefig(os.path.join(stats_dir, "loss_curve.pdf"))
+            plt.close(fig)
+
+            # -- Reward curve ---------------------------------------------------
             all_rewards_arr = np.array(all_rewards)
             all_rewards_std_arr = np.array(all_rewards_std)
-            plt.figure()
-            plt.plot(epochs, all_rewards_arr, label=f"Reward ({'+'.join(reward_types)})")
-            plt.fill_between(
+
+            fig, ax = plt.subplots(figsize=(4.0, 3.0))
+            ax.plot(
+                epochs, all_rewards_arr,
+                color="#1f3fbf",
+                label=f"Reward ({reward_label})",
+            )
+            ax.fill_between(
                 epochs,
                 all_rewards_arr - all_rewards_std_arr,
                 all_rewards_arr + all_rewards_std_arr,
-                alpha=0.3,
-                label="+/- std",
+                color="#a9bdf2",
+                alpha=0.4,
+                linewidth=0,
+                label=r"$\pm 1$ std",
             )
-            plt.xlabel("Epoch"); plt.ylabel("Reward")
-            plt.title(f"Reward Curve (student <-> teacher)  [{'+'.join(reward_types)}]")
-            plt.legend()
-            plt.savefig(os.path.join(stats_dir, "reward_curve.png"))
-            plt.close()
+            ax.axvline(
+                best_reward_epoch,
+                color="#B94F4F",
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Best epoch ({best_reward_epoch})",
+            )
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Reward")
+            ax.grid(True, linewidth=0.4, alpha=0.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.legend(frameon=False, loc="best")
+            fig.tight_layout()
+            fig.savefig(os.path.join(stats_dir, "reward_curve.png"))
+            fig.savefig(os.path.join(stats_dir, "reward_curve.pdf"))
+            plt.close(fig)
 
 
 if __name__ == "__main__":

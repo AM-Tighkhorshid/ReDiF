@@ -26,6 +26,9 @@ parser.add_argument("--student_model", default="/media/external20/amirhossein_ti
 parser.add_argument("--teacher_steps", type=int, default=50, help="Teacher diffusion steps")
 parser.add_argument("--student_steps", type=int, default=5, help="Student diffusion steps")
 parser.add_argument("--batch_size", type=int, default=32, help="Batch size for metrics calculation") # batch size is added
+parser.add_argument("--gen_bs", type=int, default=24, help="Batch size for image generation")  # NEW
+parser.add_argument("--skip_teacher", action="store_true", help="Skip teacher generation and evaluation (run it once, then reuse)")  # NEW
+parser.add_argument("--cache_dir", default="/tmp", help="Where to cache real-image / text CLIP features")  # NEW
 
 args = parser.parse_args()
 
@@ -87,27 +90,38 @@ if len(prompts) < args.num_images:
 # --------------------
 # Generation
 # --------------------
-def generate_images(model_dir, prompts, out_dir, num_steps):
+def generate_images(model_dir, prompts, out_dir, num_steps, gen_bs=args.gen_bs):
     existing_pngs = sorted([f for f in os.listdir(out_dir) if f.endswith(".png")])
     if len(existing_pngs) >= len(prompts):
         print(f"Skipping generation for {model_dir}, found {len(existing_pngs)} images.")
         return
 
+    # Resume from where a previous run stopped (assumes contiguous 0000..N naming)
+    start = len(existing_pngs)
+
     pipe = StableDiffusionPipeline.from_pretrained(
         model_dir, torch_dtype=torch.float16, safety_checker=None
     ).to(DEVICE)
     pipe.set_progress_bar_config(disable=True)
+    # VAE slicing keeps memory low when decoding a large batch at once
+    pipe.enable_vae_slicing()
 
-    # torch.imference_model for better and faster generation
+    # torch.inference_mode for better and faster generation
     with torch.inference_mode():
-        for i, p in enumerate(tqdm(prompts, desc=f"Generate {model_dir}")):
-            img = pipe(p, num_inference_steps=num_steps).images[0]
-            img.save(os.path.join(out_dir, f"{i:04}.png"))
+        # Batched generation: feeding a list of prompts saturates the GPU far
+        # better than one prompt at a time (this was the main bottleneck)
+        for i in tqdm(range(start, len(prompts), gen_bs), desc=f"Generate {os.path.basename(model_dir)}"):
+            chunk = prompts[i:i + gen_bs]
+            imgs = pipe(chunk, num_inference_steps=num_steps).images
+            for j, img in enumerate(imgs):
+                img.save(os.path.join(out_dir, f"{i + j:04}.png"))
 
     del pipe
     torch.cuda.empty_cache()
 
-generate_images(TEACHER_MODEL, prompts, TEACHER_DIR, args.teacher_steps)
+# Teacher outputs are identical across all student runs, so generate them once
+if not args.skip_teacher:
+    generate_images(TEACHER_MODEL, prompts, TEACHER_DIR, args.teacher_steps)
 generate_images(STUDENT_MODEL, prompts, STUDENT_DIR, args.student_steps)
 
 # --------------------
@@ -152,21 +166,21 @@ def extract_clip_features_batched(image_paths, batch_size=args.batch_size):
     dataset = ImagePathDataset(image_paths, transform=clip_transform)
     # num_workers=4 makes cpu working faster
     loader = DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
-    
+
     features = []
     for batch in tqdm(loader, desc="Extracting CLIP Image Features"):
         batch = batch.to(DEVICE)
         feat = clip_model.get_image_features(batch)
         feat = F.normalize(feat, dim=-1)
         features.append(feat.cpu().numpy())
-    
+
     return np.concatenate(features, axis=0)
 
 @torch.inference_mode()
 def extract_text_features_batched(prompts, batch_size=args.batch_size):
     tokenizer = clip_processor.tokenizer
     features = []
-    
+
     for i in tqdm(range(0, len(prompts), batch_size), desc="Extracting CLIP Text Features"):
         batch_prompts = prompts[i:i+batch_size]
         encodings = tokenizer(
@@ -174,11 +188,11 @@ def extract_text_features_batched(prompts, batch_size=args.batch_size):
         )
         for key in encodings:
             encodings[key] = encodings[key][:, :77].to(DEVICE)
-            
+
         feat = clip_model.get_text_features(**encodings)
         feat = F.normalize(feat, dim=-1)
         features.append(feat.cpu().numpy())
-        
+
     return np.concatenate(features, axis=0)
 
 def pairwise_distances_np(a, b):
@@ -194,15 +208,15 @@ def compute_prdc(real_features, fake_features, nearest_k=5):
     fk = np.sort(d_ff, axis=1)[:, nearest_k]
     d_fr = pairwise_distances_np(fake_features, real_features)
     d_rf = pairwise_distances_np(real_features, fake_features)
-    
+
     nearest_real_idx = np.argmin(d_fr, axis=1)
     nearest_real_dist = d_fr.min(axis=1)
     precision = (nearest_real_dist <= rk[nearest_real_idx]).mean()
-    
+
     nearest_fake_idx = np.argmin(d_rf, axis=1)
     nearest_fake_dist = d_rf.min(axis=1)
     recall = (nearest_fake_dist <= fk[nearest_fake_idx]).mean()
-    
+
     density = ((d_fr.T <= rk.reshape(-1, 1)).sum(axis=1) / float(nearest_k)).mean()
     coverage = ((d_fr.T <= rk.reshape(-1, 1)).sum(axis=1) > 0).mean()
     return dict(precision=float(precision), recall=float(recall), density=float(density), coverage=float(coverage))
@@ -210,36 +224,36 @@ def compute_prdc(real_features, fake_features, nearest_k=5):
 @torch.inference_mode()
 def compute_fid_batched(gt_paths, gen_paths, batch_size=args.batch_size):
     fid = FrechetInceptionDistance().to(DEVICE)
-    
+
     real_dataset = ImagePathDataset(gt_paths, transform=fid_transform)
     real_loader = DataLoader(real_dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
     for batch in tqdm(real_loader, desc="FID - Processing Real"):
         fid.update(batch.to(DEVICE), real=True)
-        
+
     fake_dataset = ImagePathDataset(gen_paths, transform=fid_transform)
     fake_loader = DataLoader(fake_dataset, batch_size=batch_size, num_workers=4, pin_memory=True)
     for batch in tqdm(fake_loader, desc="FID - Processing Fake"):
         fid.update(batch.to(DEVICE), real=False)
-        
+
     return float(fid.compute())
 
 def evaluate_model(model_name, gen_folder, prompts, gt_paths, real_img_feats, text_feats, save_metrics_path):
     gen_files = sorted([os.path.join(gen_folder, f) for f in os.listdir(gen_folder) if f.endswith(".png")])[:len(prompts)]
-    
+
     results = {}
     print(f"\n--- Evaluating {model_name} ---")
-    
+
     # 1. FID
     results["FID"] = compute_fid_batched(gt_paths, gen_files)
-    
+
     # 2. Extract Fake Image Features for CLIP & PRDC
     fake_img_feats = extract_clip_features_batched(gen_files)
-    
+
     # 3. CLIP Score
     sims = (fake_img_feats * text_feats).sum(axis=1)
     sims01 = (sims + 1.0) / 2.0
     results["CLIP_score"] = float(sims01.mean())
-    
+
     # 4. PRDC
     print("Computing PRDC (this may take a moment)...")
     prdc_metrics = compute_prdc(real_img_feats, fake_img_feats)
@@ -255,10 +269,23 @@ def evaluate_model(model_name, gen_folder, prompts, gt_paths, real_img_feats, te
             f.write(f"{k}: {v}\n")
 
 # --- Finding mutual features ---
-print("\nExtracting Global Features (Real Images & Texts)...")
-global_text_feats = extract_text_features_batched(prompts)
-global_real_feats = extract_clip_features_batched(gt_images)
+# Real-image and text features are identical for every run, so cache them on disk.
+# NOTE: run one job alone first to build the cache, otherwise parallel jobs race on this file.
+os.makedirs(args.cache_dir, exist_ok=True)
+cache_path = os.path.join(
+    args.cache_dir, f"realfeats_{args.dataset}_{args.split}_{args.num_images}.npz"
+)
+if os.path.exists(cache_path):
+    print(f"\nLoading cached global features from {cache_path}")
+    cached = np.load(cache_path)
+    global_text_feats, global_real_feats = cached["text"], cached["real"]
+else:
+    print("\nExtracting Global Features (Real Images & Texts)...")
+    global_text_feats = extract_text_features_batched(prompts)
+    global_real_feats = extract_clip_features_batched(gt_images)
+    np.savez(cache_path, text=global_text_feats, real=global_real_feats)
 
 # ---  Models Evaluation ---
-evaluate_model("Teacher", TEACHER_DIR, prompts, gt_images, global_real_feats, global_text_feats, os.path.join(TEACHER_MODEL, "metrics.txt"))
+if not args.skip_teacher:
+    evaluate_model("Teacher", TEACHER_DIR, prompts, gt_images, global_real_feats, global_text_feats, os.path.join(TEACHER_MODEL, "metrics.txt"))
 evaluate_model("Student", STUDENT_DIR, prompts, gt_images, global_real_feats, global_text_feats, os.path.join(STUDENT_MODEL, "metrics.txt"))
