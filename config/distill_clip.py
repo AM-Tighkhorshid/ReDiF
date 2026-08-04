@@ -99,7 +99,7 @@ def get_config():
     train.timestep_fraction = 1.0    # fraction of student.num_steps trained on per inner epoch
     # Weight of the analytic latent-space KL(student || teacher) regularizer
     # added to the PPO loss. 0 disables it.
-    train.kl_coef = 1.0
+    train.kl_coef = 0.0
 
     ###### Prompts ######
     config.prompt_fn = "imagenet_animals"
