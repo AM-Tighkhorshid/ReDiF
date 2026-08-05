@@ -7,8 +7,8 @@ captions. Here conditioning is a class label, samples are 64x64, and the model i
 
 What it reports
 ---------------
-  FID                 student vs. the reference set (real ImageNet images by default, or the
-                      teacher's own samples with --ref teacher).
+  FID                 student vs. the reference set (real ImageNet images if you have them,
+                      otherwise the teacher's own samples -- see --ref).
   FID_teacher         teacher vs. the same reference set. The gap FID - FID_teacher is the part of
                       the degradation actually caused by distillation, as opposed to by the teacher.
   paired_*            per-pair student-vs-teacher agreement from the SAME (z_T, class): CLIP / DINOv3
@@ -19,19 +19,15 @@ What it reports
   class_acc           Top-1 agreement of a pretrained ImageNet classifier with the conditioning
                       label -- does the student still generate the class it was asked for?
 
-Real evaluation data
---------------------
-With --ref real (the default) the script needs a folder of real ImageNet images. If
---real_dir does not exist or holds too few images it is downloaded automatically into
-<repo>/../Dataset/imagenet_val_64 (override with --real_dir / --no_download). Teacher images are
-NEVER regenerated for this: --source cache still reuses the teacher pool built during training.
-
 Usage
 -----
   python eval_imagenet_edm.py \\
-      --student_ckpt logs/<run>/steps8/best.pt \\
+      --student_ckpt logs/<run>/steps4/best.pt \\
       --edm_repo /path/to/edm \\
-      --num_pairs 10000 --num_images 10000
+      --num_images 10000 --ref teacher
+
+  # against real data instead (folder of images, any layout, recursively globbed):
+  python eval_imagenet_edm.py --student_ckpt ... --ref real --real_dir /data/imagenet/val
 """
 
 import argparse
@@ -46,17 +42,6 @@ import torch
 import torch.nn.functional as F
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# scripts/ -> ddpo-pytorch-main/ -> ddpo-pytorch-main/ -> diffusion_distillation/
-DATA_ROOT = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir, os.pardir, "Dataset"))
-DEFAULT_REAL_DIR = os.path.join(DATA_ROOT, "imagenet_val_64")
-
-# Tried in order when the real-image folder is missing. All ImageNet mirrors on HuggingFace
-# require accepting the licence once; `huggingface-cli login` afterwards is enough.
-HF_CANDIDATES = [
-    ("benjamin-paine/imagenet-1k-64x64", "validation"),
-    ("evanarlian/imagenet_1k_resized_256", "val"),
-    ("ILSVRC/imagenet-1k", "validation"),
-]
 
 
 def load_train_module():
@@ -107,22 +92,21 @@ def parse_args():
     p.add_argument("--skip_teacher", action="store_true",
                    help="Reuse a previously written teacher sample cache.")
 
-    p.add_argument("--ref", type=str, default="real", choices=["teacher", "real"],
-                   help="real = FID of BOTH student and teacher against real ImageNet images "
-                        "(downloaded if missing). teacher = distance to the teacher's own samples.")
-    p.add_argument("--real_dir", type=str, default=DEFAULT_REAL_DIR,
-                   help="Folder of real ImageNet images. Downloaded here if absent.")
-    p.add_argument("--real_seed", type=int, default=0,
-                   help="Seed for subsampling the real folder; fixed => reproducible reference set.")
-    p.add_argument("--real_resample", type=str, default="box", choices=["box", "bicubic"],
-                   help="Down-sampling filter for real images. 'box' (area) matches the ADM/EDM "
-                        "ImageNet-64 preprocessing; 'bicubic' does not and inflates FID.")
-    p.add_argument("--hf_dataset", type=str, default=None,
-                   help="Force a specific HuggingFace dataset for the download, e.g. "
-                        "'benjamin-paine/imagenet-1k-64x64'. Default: try a built-in list.")
-    p.add_argument("--hf_split", type=str, default=None, help="Split to use with --hf_dataset.")
-    p.add_argument("--no_download", action="store_true",
-                   help="Fail instead of downloading real images.")
+    p.add_argument("--ref", type=str, default="real", choices=["real", "teacher"],
+                   help="real = FID against actual ImageNet images (reported for BOTH student and "
+                        "teacher). teacher = fallback when no ImageNet data is available; then only "
+                        "the student-vs-teacher distance is meaningful.")
+    p.add_argument("--real_dir", type=str, default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/Dataset/imagenet_val_64",
+                   help="Folder of ImageNet images, globbed recursively (e.g. the val/ directory).")
+    p.add_argument("--num_real", type=int, default=10000,
+                   help="How many real images to use. Independent of the number of generated samples: "
+                        "a larger real set costs almost nothing and lowers FID variance.")
+    p.add_argument("--real_resize", type=str, default="box", choices=["box", "bicubic"],
+                   help="Downsampling filter for real images. box matches the standard downsampled-"
+                        "ImageNet-64 protocol EDM was trained and evaluated on; bicubic does not, and "
+                        "shifts FID by a non-trivial amount.")
+    p.add_argument("--real_cache", type=str, default=None,
+                   help="Path to cache the preprocessed 64x64 real images (default: alongside --out_dir).")
     p.add_argument("--fid_batch", type=int, default=128)
 
     p.add_argument("--reward_fn", type=str, default="clip+dino+lpips+mse",
@@ -181,12 +165,17 @@ def build_eval_set(args, net):
             raise FileNotFoundError(f"{args.teacher_cache} not found -- run training (or "
                                     "--precompute_only) first, or use --source fresh.")
         blob = torch.load(args.teacher_cache, map_location="cpu")
-        if blob["pool_seed"] != args.pool_seed or blob["num_pairs"] != args.num_pairs:
+        print(f"[cache] {os.path.abspath(args.teacher_cache)}: pool_seed={blob.get('pool_seed')}, "
+              f"num_pairs={blob.get('num_pairs')}, teacher_steps={blob.get('teacher_steps')}")
+        if blob["pool_seed"] != args.pool_seed:
             raise ValueError(
-                f"Cache was built with pool_seed={blob['pool_seed']}, num_pairs={blob['num_pairs']} "
-                f"but you passed {args.pool_seed}/{args.num_pairs}. The latents rebuilt here would "
-                f"not correspond to the cached teacher images. Pass "
-                f"--pool_seed {blob['pool_seed']} --num_pairs {blob['num_pairs']}.")
+                f"Cache was built with pool_seed={blob['pool_seed']} but you passed {args.pool_seed}. "
+                "The latents rebuilt here would not correspond to the cached teacher images.")
+        if blob["num_pairs"] != args.num_pairs:
+            # Adopt the cache's pool size: a different size changes the class labels, not just the
+            # count, so the pool must be rebuilt at exactly the size the cache was written with.
+            print(f"[cache] adopting the cached pool size ({args.num_pairs} -> {blob['num_pairs']})")
+            args.num_pairs = blob["num_pairs"]
         pool = T.PairPool(args.num_pairs, args.num_classes_used, net.label_dim,
                           net.img_channels, net.img_resolution, args.pool_seed)
         n = args.num_images or pool.n
@@ -224,120 +213,50 @@ def sample_batched(net, latents, classes, args, device, kind, sigmas=None, eta=0
     return out
 
 
-# ---------------------------------------------------------------------------------------------
-# Real evaluation data (ADDITION 1): presence check + automatic download
-# ---------------------------------------------------------------------------------------------
+def load_real_images(real_dir, n, resolution=64, resize="box", cache=None, seed=0):
+    """Preprocess a folder of ImageNet images into uint8 [N,3,64,64].
 
+    Two details that quietly ruin FID if you get them wrong:
 
-IMAGE_EXTS = ("*.png", "*.jpg", "*.jpeg", "*.JPEG", "*.webp")
+    * Ordering. A recursive glob over an ImageNet directory comes back sorted by class folder, so
+      taking the first N images would give you a handful of classes. The paths are shuffled with a
+      fixed seed first, which keeps the reference set class-balanced and reproducible.
+    * Filter. Downsampled ImageNet-64 (Chrabaszcz et al.) is built with a box filter, and that is
+      the distribution EDM was trained on. Using bicubic here makes the reference sharper than the
+      training data and inflates FID for both models.
+    """
+    if cache and os.path.exists(cache):
+        blob = torch.load(cache, map_location="cpu")
+        if blob["n"] >= n and blob["resize"] == resize:
+            print(f"[real] loaded {n}/{blob['n']} cached images from {cache}")
+            return blob["images"][:n]
 
-
-def list_images(directory):
-    if not os.path.isdir(directory):
-        return []
+    from PIL import Image
+    filt = Image.BOX if resize == "box" else Image.BICUBIC
+    exts = ("*.png", "*.jpg", "*.jpeg", "*.JPEG", "*.webp", "*.JPG")
     paths = []
-    for e in IMAGE_EXTS:
-        paths += glob.glob(os.path.join(directory, "**", e), recursive=True)
-    return sorted(paths)
-
-
-def center_crop_resize(im, resolution, resample):
-    """Square centre crop then down-sample, matching the ADM/EDM ImageNet-64 preprocessing."""
-    from PIL import Image
-    filt = Image.BOX if resample == "box" else Image.BICUBIC
-    w, h = im.size
-    side = min(w, h)
-    im = im.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
-    return im.resize((resolution, resolution), filt)
-
-
-def _stream_split(dataset, split, n, dest_dir, resolution, resample, seed):
-    """Write n images from a streamed HuggingFace split into dest_dir as 64x64 PNGs."""
-    from datasets import load_dataset
-    ds = load_dataset(dataset, split=split, streaming=True)
-    # Shuffling the stream keeps the subset class-balanced: the student covers all 1000 classes
-    # uniformly, so a class-ordered prefix would be the wrong reference distribution.
-    ds = ds.shuffle(seed=seed, buffer_size=min(10000, max(1000, 5 * n)))
-    os.makedirs(dest_dir, exist_ok=True)
-    saved = 0
-    for rec in ds:
-        im = rec.get("image", rec.get("img", rec.get("jpg")))
-        if im is None:
-            raise RuntimeError(f"No image column in {dataset}; columns are {list(rec)}.")
-        center_crop_resize(im.convert("RGB"), resolution, resample).save(
-            os.path.join(dest_dir, f"{saved:06d}.png"))
-        saved += 1
-        if saved % 250 == 0:
-            print(f"\r  [real] downloaded {saved}/{n}", end="", flush=True)
-        if saved >= n:
-            break
-    print()
-    return saved
-
-
-def download_imagenet_val(dest_dir, n, resolution, resample, seed, dataset=None, split=None):
-    """Download an ImageNet validation subset into dest_dir. Streaming: the full set is never pulled."""
-    try:
-        import datasets  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError("`pip install datasets` is needed to download the evaluation set, "
-                           "or point --real_dir at an existing ImageNet folder.") from e
-
-    candidates = [(dataset, split or "validation")] if dataset else HF_CANDIDATES
-    errors = []
-    for ds_name, ds_split in candidates:
-        print(f"[real] downloading {n} images from {ds_name}:{ds_split} -> {dest_dir}")
-        try:
-            got = _stream_split(ds_name, ds_split, n, dest_dir, resolution, resample, seed)
-            if got >= n:
-                return dest_dir
-            errors.append(f"{ds_name}: only {got} images")
-        except Exception as e:  # gated repo, missing split, network, ...
-            print(f"[real] {ds_name} failed: {type(e).__name__}: {e}")
-            errors.append(f"{ds_name}: {type(e).__name__}")
-
-    raise RuntimeError(
-        "Could not fetch an ImageNet validation subset automatically (" + "; ".join(errors) + ").\n"
-        "Every ImageNet mirror on HuggingFace is licence-gated: open the dataset page, accept the "
-        "terms once, run `huggingface-cli login`, then rerun. Alternatively copy any folder of "
-        f"ImageNet val images to {dest_dir} (any layout, globbed recursively) and rerun.")
-
-
-def ensure_real_images(args, n, resolution=64):
-    """Check that enough real images exist, download them if not, then load n of them as uint8."""
-    have = len(list_images(args.real_dir))
-    print(f"[real] {args.real_dir}: {have} images found, {n} needed")
-    if have < n:
-        if args.no_download:
-            raise RuntimeError(f"{args.real_dir} has {have} images, need {n}, --no_download set.")
-        os.makedirs(os.path.dirname(os.path.abspath(args.real_dir)), exist_ok=True)
-        download_imagenet_val(args.real_dir, n, resolution, args.real_resample,
-                              args.real_seed, args.hf_dataset, args.hf_split)
-    return load_real_images(args.real_dir, n, resolution, args.real_resample, args.real_seed)
-
-
-def load_real_images(real_dir, n, resolution=64, resample="box", seed=0):
-    """Load a random (hence class-balanced) subset of a real-image folder as uint8 [N,3,64,64]."""
-    from PIL import Image
-    paths = list_images(real_dir)
+    for e in exts:
+        paths += glob.glob(os.path.join(real_dir, "**", e), recursive=True)
+    paths = sorted(set(paths))
     if len(paths) < n:
-        raise RuntimeError(f"Found only {len(paths)} images in {real_dir}, need {n}.")
-
-    # Sorted order on ImageNet is class-ordered (n01440764/, n01443537/, ...), so taking a prefix
-    # would cover only the first few classes while the student spans all 1000. Sample uniformly.
+        raise RuntimeError(f"Found only {len(paths)} images under {real_dir}, need {n}.")
     rng = np.random.default_rng(seed)
-    sel = np.sort(rng.choice(len(paths), size=n, replace=False))
-    paths = [paths[i] for i in sel]
+    paths = [paths[i] for i in rng.permutation(len(paths))[:n]]
 
     out = torch.empty(n, 3, resolution, resolution, dtype=torch.uint8)
     for i, path in enumerate(paths):
         im = Image.open(path).convert("RGB")
-        if im.size != (resolution, resolution):
-            im = center_crop_resize(im, resolution, resample)
+        w, h = im.size
+        side = min(w, h)
+        im = im.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+        im = im.resize((resolution, resolution), filt)
         out[i] = torch.from_numpy(np.array(im)).permute(2, 0, 1)
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 1000 == 0:
             print(f"\r  [real] {i + 1}/{n}", end="", flush=True)
     print()
+    if cache:
+        torch.save({"images": out, "n": n, "resize": resize}, cache)
+        print(f"[real] cached to {cache}")
     return out
 
 
@@ -465,6 +384,13 @@ def main():
               "published 50k-sample FIDs. Treat it as a relative number within this study only.")
 
     student = T.copy.deepcopy(net)
+    # Detect LoRA from the checkpoint's own keys rather than from a metadata field: older
+    # checkpoints predate that field, and the weights can never lie about their own layout.
+    lora_names = T.apply_lora_from_state_dict(student, ck["model"], ck.get("lora_alpha", 0))
+    if lora_names:
+        print(f"[init] rebuilt {len(lora_names)} LoRA adapters "
+              f"(rank {ck['model'][lora_names[0] + '.A'].shape[0]}) before loading")
+        student.to(device)
     student.load_state_dict(ck["model"])
     student.eval().requires_grad_(False)
     sigmas = (ck["sigmas"].to(device) if "sigmas" in ck else
@@ -477,13 +403,17 @@ def main():
 
     # ---- reference set ----------------------------------------------------------------------
     if args.ref == "real":
-        # ADDITION 1: check the evaluation dataset is there, download it if not. The teacher
-        # images above are untouched by this -- they still come from the training cache.
-        ref_u8 = ensure_real_images(args, n_eval)
+        if not args.real_dir:
+            raise ValueError("--ref real requires --real_dir (a folder of ImageNet images).")
+        real_cache = args.real_cache or os.path.join(
+            out_dir, f"real_in64_n{args.num_real}_{args.real_resize}.pt")
+        print(f"[ref] preparing {args.num_real} real ImageNet images ...")
+        ref_u8 = load_real_images(args.real_dir, args.num_real, resize=args.real_resize,
+                                  cache=real_cache)
     else:
         ref_u8 = teacher_u8
-        print("[ref] using the teacher's own samples as the reference distribution. This measures "
-              "distance to the TEACHER, not to real ImageNet -- label it as such in the paper.")
+        print("[ref] no real data: using the teacher's own samples as the reference. This measures "
+              "distance to the TEACHER, not to ImageNet -- label it as such in the paper.")
 
     results = {"student_ckpt": args.student_ckpt, "epoch": ck.get("epoch"),
                "num_steps": num_steps, "student_eta": args.student_eta,
@@ -491,15 +421,20 @@ def main():
                "split": split, "reference": args.ref}
 
     # ---- FID --------------------------------------------------------------------------------
-    # ADDITION 2: with --ref real both the student AND the teacher are scored against the real
-    # data, so the table can show how much of the FID is the teacher's and how much distillation's.
-    print("[metric] FID (student) ...")
-    results["FID"] = compute_fid(ref_u8, student_u8, device, args.fid_batch)
+    # Both models are scored against the SAME reference with the SAME sample count, so the two
+    # numbers share whatever small-sample bias the setup has and their difference is meaningful
+    # even when the absolute values are not comparable with published 50k-sample FIDs.
+    print(f"[metric] FID student vs {args.ref} ...")
+    results["FID_student"] = compute_fid(ref_u8, student_u8, device, args.fid_batch)
+    results["num_real"] = len(ref_u8)
+
     if args.ref == "real":
-        results["real_dir"] = args.real_dir
-        print("[metric] FID (teacher) ...")
+        print("[metric] FID teacher vs real ...")
         results["FID_teacher"] = compute_fid(ref_u8, teacher_u8, device, args.fid_batch)
-        results["FID_gap"] = results["FID"] - results["FID_teacher"]
+        # The part of the degradation caused by distillation rather than by the teacher itself.
+        results["FID_gap"] = results["FID_student"] - results["FID_teacher"]
+        print(f"[metric] student {results['FID_student']:.3f} | teacher "
+              f"{results['FID_teacher']:.3f} | gap {results['FID_gap']:.3f}")
 
     # ---- paired reward terms ------------------------------------------------------------------
     print("[metric] paired student-vs-teacher terms ...")
@@ -509,7 +444,7 @@ def main():
     # ---- PRDC -------------------------------------------------------------------------------
     if "dino" in bank.terms:
         k = min(args.prdc_samples, n_eval)
-        print(f"[metric] PRDC on {k} DINOv3 features (reference: {args.ref}) ...")
+        print(f"[metric] PRDC on {k} DINOv3 features ...")
         f_ref = dino_features(bank, ref_u8[:k], device)
         f_gen = dino_features(bank, student_u8[:k], device)
         results.update(compute_prdc(f_ref, f_gen, args.prdc_k))

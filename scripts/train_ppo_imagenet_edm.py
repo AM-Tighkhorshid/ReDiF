@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--sigma_min", type=float, default=0.002)
     p.add_argument("--sigma_max", type=float, default=80.0)
     p.add_argument("--rho", type=float, default=7.0)
-    p.add_argument("--eta", type=float, default=0.3,
+    p.add_argument("--eta", type=float, default=1.0,
                    help="Exploration level of the ancestral step (analogue of DDIM eta). eta=0 is fully "
                         "deterministic => zero-variance policy => no policy gradient at all. eta=1 is the "
                         "fully ancestral (DDPM-like) step, which with only 4 steps throws away almost all of "
@@ -100,8 +100,18 @@ def parse_args():
     p.add_argument("--num_classes_used", type=int, default=1000,
                    help="Restrict the pool to the first K ImageNet classes (K=1000 => all).")
     p.add_argument("--pool_seed", type=int, default=1234)
+    p.add_argument("--active_pairs", type=int, default=0,
+                   help="Sample rollouts only from the first N pairs of the pool (0 = all). The pool "
+                        "and its cached teacher images are unchanged, so this costs nothing. With a "
+                        "10k pool and 256 samples/epoch each pair is revisited once every 40 epochs, "
+                        "which is why per-pair statistics never accumulate; DDPO works with under a "
+                        "thousand prompts it returns to constantly.")
     p.add_argument("--teacher_cache", type=str, default="./teacher_cache_in64.pt",
                    help="Resolved relative to the CURRENT WORKING DIRECTORY, not to this script.")
+    p.add_argument("--overwrite_cache", type=int, default=0,
+                   help="0 = if an existing --teacher_cache belongs to a different pool, write the "
+                        "newly generated one to a suffixed filename instead of replacing it. The old "
+                        "cache is usually still needed for evaluation.")
     p.add_argument("--reuse_cache_pool", type=int, default=1,
                    help="If an existing cache has the same --pool_seed but a different --num_pairs, "
                         "adopt the cache's size instead of regenerating everything.")
@@ -130,7 +140,18 @@ def parse_args():
     p.add_argument("--clip_range", type=float, default=1e-4,
                    help="PPO clip range. Small because log-probs are averaged over pixels (DDPO convention).")
     p.add_argument("--adv_clip_max", type=float, default=5.0)
-    p.add_argument("--group_size", type=int, default=4,
+    p.add_argument("--ppo_style", type=str, default="coco", choices=["coco", "pairs"],
+                   help="coco = the exact update structure of train_ppo_coco.py: iterate over "
+                        "rollout minibatches, and within each, over timestep POSITIONS with a "
+                        "per-sample shuffled order, accumulating gradients across every "
+                        "(minibatch, timestep) and taking ONE optimizer step per inner epoch. "
+                        "pairs = the earlier variant here, which flattened (sample, timestep) into "
+                        "independent minibatches and stepped after each one.")
+    p.add_argument("--kl_style", type=str, default="coco_latent", choices=["coco_latent", "per_step_ref"],
+                   help="coco_latent = the SD script's regularizer: 0.5*||x_student_final - "
+                        "x_teacher||^2, one scalar per rollout batch. per_step_ref = the per-step "
+                        "drift penalty against a frozen reference policy used earlier here.")
+    p.add_argument("--group_size", type=int, default=1,
                    help="How many rollouts share the same (z_T, class) pair within a batch, differing "
                         "only in the policy's exploration noise. With group_size > 1 the advantage is "
                         "whitened INSIDE each group, so it reflects the policy's own choices instead of "
@@ -141,7 +162,7 @@ def parse_args():
                         "pair, so pair identity -- not class -- is what determines the achievable reward. "
                         "'class' pools 1000 classes and almost never fills its buffer.")
     p.add_argument("--stat_buffer", type=int, default=16)
-    p.add_argument("--stat_min_count", type=int, default=8)
+    p.add_argument("--stat_min_count", type=int, default=16)
     p.add_argument("--adv_normalize", type=str, default="global_std",
                    choices=["group_std", "global_std", "mean_only"],
                    help="How the group-relative advantage is scaled. group_std divides by each "
@@ -167,7 +188,23 @@ def parse_args():
     p.add_argument("--adam_beta2", type=float, default=0.999)
     p.add_argument("--adam_eps", type=float, default=1e-8)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--step_weighting", type=str, default="sigma", choices=["none", "sigma"],
+    p.add_argument("--lora_rank", type=int, default=0,
+                   help="0 = full fine-tune. >0 attaches rank-r LoRA to the modules matching "
+                        "--lora_targets and freezes everything else, mirroring the SD branch. Use "
+                        "with a LoRA-scale learning rate (3e-4), not the full-finetune 1e-5.")
+    p.add_argument("--lora_alpha", type=float, default=0,
+                   help="LoRA scaling; 0 means alpha = rank (scale 1.0).")
+    p.add_argument("--lora_targets", type=str, default="qkv|proj|affine",
+                   help="Regex over module names. EDM's attention is qkv/proj 1x1 convs; affine is "
+                        "the per-block conditioning projection.")
+    p.add_argument("--trainable_regex", type=str, default="",
+                   help="Only parameters whose name matches this regex are trained; everything else "
+                        "is frozen. The REINFORCE gradient's alignment with the true gradient scales "
+                        "like sqrt(n_samples / n_params), so shrinking the parameter space is the "
+                        "cheapest way to raise the signal-to-noise ratio -- the same reason the SD "
+                        "branch uses LoRA. Useful values for the EDM UNet: 'dec\\.' (decoder only), "
+                        "'qkv|proj' (attention), 'bias$|norm' (BitFit-style, ~0.1% of the weights).")
+    p.add_argument("--step_weighting", type=str, default="none", choices=["none", "sigma"],
                    help="The log-prob gradient at step t scales like 1/sigma_up[t], and sigma_up spans "
                         "~12 down to ~0.0006 over a 16-step Karras schedule. Unweighted, the last two "
                         "steps produce gradients ~10^4x larger than the first ones and, after grad-norm "
@@ -202,7 +239,7 @@ def parse_args():
                    help="Encoders expect 224px; ImageNet-64 samples are bicubically upsampled.")
 
     # --- logging / io -------------------------------------------------------------------------
-    p.add_argument("--output_dir", type=str, default="./logs")
+    p.add_argument("--output_dir", type=str, default="./edm_logs")
     p.add_argument("--run_name", type=str, default="",
                    help="Sub-directory name. Empty => auto-generated from the reward terms, kl, "
                         "batch size and lr (same convention as the SD branch).")
@@ -212,6 +249,12 @@ def parse_args():
     p.add_argument("--resume_from", type=str, default="",
                    help="Checkpoint .pt to resume the student (and optimizer) from.")
     p.add_argument("--sample_every", type=int, default=1, help="Epochs between eval-image dumps.")
+    p.add_argument("--eval_reward_n", type=int, default=64,
+                   help="Pairs used for the deterministic held-out reward logged each epoch as "
+                        "eval_reward. Fixed pairs + eta=0 removes almost all the variance that makes "
+                        "the training reward_mean unreadable. 0 disables it.")
+    p.add_argument("--eval_eta", type=float, default=0.0,
+                   help="eta for the eval_reward pass. 0 = deterministic Euler = deployment setting.")
     p.add_argument("--eval_seed", type=int, default=12345,
                    help="Fixed seed for the eval grid, so before/after comparisons are like-for-like.")
     p.add_argument("--allow_tf32", type=int, default=1)
@@ -327,22 +370,35 @@ def one_hot_labels(class_ids, label_dim, device):
     return F.one_hot(class_ids.to(device), num_classes=label_dim).to(torch.float32)
 
 
+def _as_batch(v, x):
+    """Accept a python float or a per-sample tensor; return a [B] float tensor on x's device."""
+    if not torch.is_tensor(v):
+        return torch.full((x.shape[0],), float(v), device=x.device, dtype=torch.float32)
+    return v.to(device=x.device, dtype=torch.float32).reshape(-1)
+
+
 def edm_step_mean(net, x, sigma_from, sigma_down, labels):
     """Euler step towards sigma_down. Returns (mean, denoised).
 
     mean = x + (sigma_down - sigma_from) * (x - D_theta(x, sigma_from)) / sigma_from
+
+    sigma_from/sigma_down may be scalars or per-sample tensors. Per-sample support is what lets the
+    COCO-style update train a whole rollout batch at a *different* timestep per sample in one
+    forward, exactly as the SD script's `t_perm` shuffling does.
     """
-    sigma_b = torch.full((x.shape[0],), sigma_from, device=x.device, dtype=torch.float32)
-    denoised = net(x, sigma_b, labels)
-    d = (x - denoised) / sigma_from
-    mean = x + (sigma_down - sigma_from) * d
+    sf = _as_batch(sigma_from, x)
+    sd = _as_batch(sigma_down, x)
+    denoised = net(x, sf, labels)
+    sf4, sd4 = sf.view(-1, 1, 1, 1), sd.view(-1, 1, 1, 1)
+    d = (x - denoised) / sf4
+    mean = x + (sd4 - sf4) * d
     return mean, denoised
 
 
 def gaussian_logprob(x_next, mean, sigma_up):
     """Isotropic Gaussian log-density, averaged over pixel dimensions (DDPO convention)."""
-    var = sigma_up ** 2
-    lp = -((x_next - mean) ** 2) / (2 * var) - math.log(sigma_up) - 0.5 * math.log(2 * math.pi)
+    s = _as_batch(sigma_up, x_next).view(-1, 1, 1, 1)
+    lp = -((x_next - mean) ** 2) / (2 * s ** 2) - s.log() - 0.5 * math.log(2 * math.pi)
     return lp.mean(dim=tuple(range(1, lp.ndim)))
 
 
@@ -397,6 +453,123 @@ def student_rollout(net, ref_net, latents, labels, sigmas, eta, autocast_ctx):
         "ref_means": torch.stack(ref_means, dim=1),
         "images": x,
     }
+
+
+@torch.no_grad()
+def student_sample_det(net, latents, labels, sigmas, eta=0.0):
+    """Run the student's schedule with eta (0 = deterministic Euler). Used for evaluation.
+
+    Training rewards are measured under the exploration policy (eta > 0), so they understate what
+    the student can actually do: the injected noise costs reward by itself. Deployment uses eta=0,
+    and so should the progress metric -- it removes the sampling noise entirely, which is most of
+    the epoch-to-epoch variance in `reward_mean`.
+    """
+    x = latents * sigmas[0]
+    for i in range(len(sigmas) - 1):
+        s_from, s_to = float(sigmas[i]), float(sigmas[i + 1])
+        s_down, s_up = ancestral_coeffs(s_from, s_to, eta)
+        mean, _ = edm_step_mean(net, x, s_from, s_down, labels)
+        x = mean.float()
+        if s_up > 0:
+            x = x + s_up * torch.randn_like(x)
+    return x
+
+
+class LoRAWrapper(torch.nn.Module):
+    """Low-rank adapter around an EDM 1x1 Conv2d / Linear, the analogue of LoRAAttnProcessor.
+
+    The SD branch attaches LoRA to the UNet's attention processors and trains at 3e-4. EDM's
+    DhariwalUNet has no diffusers attention processors, but its attention blocks are ordinary 1x1
+    convolutions (`qkv`, `proj`), so wrapping those gives the same thing: the base weight stays
+    frozen and only a rank-r correction is learned. B starts at zero, so the student is EXACTLY the
+    teacher at init -- and a few optimizer steps at a LoRA-scale learning rate change the output
+    far more than the same steps spread over 296M full weights.
+    """
+
+    def __init__(self, base, rank, alpha):
+        super().__init__()
+        self.base = base
+        w = base.weight
+        if w.dim() == 4:
+            out_c, in_c = w.shape[0], w.shape[1]
+            self.A = torch.nn.Parameter(torch.randn(rank, in_c, 1, 1) / math.sqrt(in_c))
+            self.B = torch.nn.Parameter(torch.zeros(out_c, rank, 1, 1))
+            self.kind = "conv"
+        else:
+            out_f, in_f = w.shape
+            self.A = torch.nn.Parameter(torch.randn(rank, in_f) / math.sqrt(in_f))
+            self.B = torch.nn.Parameter(torch.zeros(out_f, rank))
+            self.kind = "linear"
+        self.scale = alpha / rank
+
+    def forward(self, x, *a, **kw):
+        out = self.base(x, *a, **kw)
+        h = x.to(self.A.dtype)
+        if self.kind == "conv":
+            delta = F.conv2d(F.conv2d(h, self.A), self.B)
+        else:
+            delta = F.linear(F.linear(h, self.A), self.B)
+        return out + self.scale * delta.to(out.dtype)
+
+
+def apply_lora(net, rank, alpha, target_regex):
+    """Wrap every matching 1x1 conv / linear in `net`. Returns the list of wrapped module names."""
+    import re
+    pat = re.compile(target_regex)
+    wrapped = []
+    for name, module in list(net.named_modules()):
+        if not pat.search(name) or isinstance(module, LoRAWrapper):
+            continue
+        w = getattr(module, "weight", None)
+        if w is None or w.dim() not in (2, 4):
+            continue
+        if w.dim() == 4 and (w.shape[2] != 1 or w.shape[3] != 1):
+            continue  # resampling / k>1 convs change the spatial size; the adapter path would not match
+        if getattr(module, "up", False) or getattr(module, "down", False):
+            continue
+        parent_name, _, attr = name.rpartition(".")
+        parent = net.get_submodule(parent_name) if parent_name else net
+        setattr(parent, attr, LoRAWrapper(module, rank, alpha))
+        wrapped.append(name)
+    return wrapped
+
+
+@torch.no_grad()
+def lora_drift(student):
+    """Frobenius norm of the learned low-rank correction, relative to the frozen base weights.
+
+    param_drift is useless under LoRA -- the base weights never move, so it stays at exactly 0.
+    This measures what actually changed: ||scale * B@A|| / ||W_base||, aggregated.
+    """
+    num, den = 0.0, 0.0
+    for m in student.modules():
+        if isinstance(m, LoRAWrapper):
+            a = m.A.detach().float().reshape(m.A.shape[0], -1)
+            b = m.B.detach().float().reshape(m.B.shape[0], -1)
+            num += ((m.scale * (b @ a)) ** 2).sum().item()
+            den += (m.base.weight.detach().float() ** 2).sum().item()
+    return math.sqrt(num / max(den, 1e-12))
+
+
+@torch.no_grad()
+def param_drift(student, reference):
+    """RMS parameter change since init, relative to the init's own RMS.
+
+    The single number that says how far the policy has actually moved. Adam steps are scale-free
+    (~lr per parameter per step), so this grows roughly like lr * sqrt(num_optimizer_steps) and is
+    far more informative than the loss: a run that degrades the model and a run that does nothing
+    look identical in the reward curve but differ by orders of magnitude here.
+    """
+    ref = dict(reference.named_parameters())
+    num, den = 0.0, 0.0
+    for name, p_s in student.named_parameters():
+        p_r = ref.get(name.replace(".base.", "."))
+        if p_r is None:
+            continue
+        d = p_s.detach().float() - p_r.detach().float().to(p_s.device)
+        num += (d ** 2).sum().item()
+        den += (p_r.detach().float() ** 2).sum().item()
+    return math.sqrt(num / max(den, 1e-12))
 
 
 @torch.no_grad()
@@ -473,8 +646,7 @@ def build_teacher_cache(args, teacher, pool, device, autocast_ctx, blob=None):
             return blob["images"]
         print(f"[cache] MISMATCH: cache is (seed={blob.get('pool_seed')}, "
               f"pairs={blob.get('num_pairs')}) but this run wants (seed={args.pool_seed}, "
-              f"pairs={pool.n}) -> regenerating. Pass --pool_seed/--num_pairs to match the cache, "
-              f"or point --teacher_cache elsewhere to keep both.")
+              f"pairs={pool.n}) -> regenerating.")
 
     print(f"[cache] generating {pool.n} teacher images with {args.teacher_steps}-step Heun "
           f"(NFE = {2 * args.teacher_steps - 1}) ...")
@@ -492,9 +664,19 @@ def build_teacher_cache(args, teacher, pool, device, autocast_ctx, blob=None):
         done = idx[-1].item() + 1
         print(f"  {done}/{pool.n}  ({time.time() - t0:.0f}s)", flush=True)
 
+    # Never clobber an existing cache that belongs to a different pool: regenerating one is hours
+    # of teacher sampling, and the old file is usually still needed for evaluation. Write the new
+    # one under a name that encodes its pool instead, and say so loudly.
+    out_path = args.teacher_cache
+    if blob is not None and not args.overwrite_cache:
+        stem, ext = os.path.splitext(args.teacher_cache)
+        out_path = f"{stem}_seed{args.pool_seed}_n{pool.n}{ext}"
+        print(f"[cache] {os.path.abspath(args.teacher_cache)} belongs to a different pool and will "
+              f"NOT be overwritten (pass --overwrite_cache 1 to force).")
+
     torch.save({"images": out, "num_pairs": pool.n, "pool_seed": args.pool_seed,
-                "teacher_steps": args.teacher_steps}, args.teacher_cache)
-    print(f"[cache] wrote {args.teacher_cache}")
+                "teacher_steps": args.teacher_steps}, out_path)
+    print(f"[cache] wrote {os.path.abspath(out_path)}")
     return out
 
 
@@ -862,6 +1044,87 @@ def make_autocast(device, dtype):
     return contextlib.nullcontext
 
 
+PLOT_RC = {
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "axes.linewidth": 0.8,
+    "lines.linewidth": 1.6,
+    "figure.dpi": 150,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "pdf.fonttype": 42,   # editable text in Illustrator, required by many venues
+    "ps.fonttype": 42,
+}
+
+
+def save_training_curves(run_dir, hist, reward_label, best_epoch):
+    """Publication-style loss / reward curves, written next to the checkpoints.
+
+    Same styling as the SD branch so both sets of figures can go in one paper. Rewritten every
+    epoch (cheap) rather than only at the end, so a run that is killed early still leaves usable
+    figures behind. Uses the Agg backend explicitly: this script normally runs headless over SSH.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[warn] plotting unavailable: {e}")
+        return
+
+    epochs = hist["epoch"]
+    if len(epochs) < 2:
+        return
+
+    with plt.rc_context(PLOT_RC):
+        # -- Loss curve ------------------------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+        ax.plot(epochs, hist["pg_loss"], color="#1f77b4", label="Policy loss")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, linewidth=0.4, alpha=0.4)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, loc="best")
+        fig.tight_layout()
+        for ext in ("png", "pdf"):
+            fig.savefig(os.path.join(run_dir, f"loss_curve.{ext}"))
+        plt.close(fig)
+
+        # -- Reward curve ----------------------------------------------------------------------
+        r = np.asarray(hist["reward_mean"], dtype=np.float64)
+        sd = np.asarray(hist["reward_std"], dtype=np.float64)
+
+        fig, ax = plt.subplots(figsize=(4.0, 3.0))
+        ax.plot(epochs, r, color="#1f3fbf", label=f"Train reward ({reward_label})")
+        ax.fill_between(epochs, r - sd, r + sd, color="#a9bdf2", alpha=0.4, linewidth=0,
+                        label=r"$\pm 1$ std")
+        # The deterministic held-out curve belongs on the same axes: identical reward terms, so the
+        # same units. The offset between the two lines is purely the cost of the exploration noise.
+        if any(v is not None for v in hist["eval_reward"]):
+            ev = np.asarray([np.nan if v is None else v for v in hist["eval_reward"]], dtype=np.float64)
+            ax.plot(epochs, ev, color="#2e8b57", label="Held-out reward (eta=0)")
+        if best_epoch is not None:
+            ax.axvline(best_epoch, color="#B94F4F", linestyle="--", linewidth=1.0,
+                       label=f"Best epoch ({best_epoch})")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Reward")
+        ax.grid(True, linewidth=0.4, alpha=0.4)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, loc="best")
+        fig.tight_layout()
+        for ext in ("png", "pdf"):
+            fig.savefig(os.path.join(run_dir, f"reward_curve.{ext}"))
+        plt.close(fig)
+
+
 def save_grid(images_pm1, path, nrow=8):
     try:
         import torchvision
@@ -888,9 +1151,47 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
     student = copy.deepcopy(base_net).to(device).eval().requires_grad_(True)
     ref_net = (copy.deepcopy(base_net).to(device).eval().requires_grad_(False)
                if args.kl_coeff > 0 else None)
+    # Held-out slice for the deterministic progress metric: the LAST pairs of the pool, so it never
+    # overlaps the first indices used for the sample grid.
+    n_ev = min(args.eval_reward_n, pool.n)
+    eval_idx = torch.arange(pool.n - n_ev, pool.n) if n_ev > 0 else None
 
     stat_tracker = PerKeyStatTracker(args.stat_buffer, args.stat_min_count)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr,
+
+    if args.lora_rank > 0:
+        alpha = args.lora_alpha or args.lora_rank
+        names = apply_lora(student, args.lora_rank, alpha, args.lora_targets)
+        student.to(device)
+        student.requires_grad_(False)
+        trainable = []
+        for n, prm in student.named_parameters():
+            keep = n.endswith(".A") or n.endswith(".B")
+            prm.requires_grad_(keep)
+            if keep:
+                trainable.append(prm)
+        if not trainable:
+            raise ValueError(f"--lora_targets '{args.lora_targets}' matched no wrappable modules.")
+        print(f"[run steps={num_steps}] LoRA rank {args.lora_rank} on {len(names)} modules "
+              f"(e.g. {names[:3]})")
+    else:
+        trainable = list(student.parameters())
+    if args.lora_rank == 0 and args.trainable_regex:
+        import re
+        pat = re.compile(args.trainable_regex)
+        trainable = []
+        for name, prm in student.named_parameters():
+            keep = bool(pat.search(name))
+            prm.requires_grad_(keep)
+            if keep:
+                trainable.append(prm)
+        if not trainable:
+            raise ValueError(f"--trainable_regex '{args.trainable_regex}' matched no parameters.")
+    n_train = sum(p.numel() for p in trainable)
+    n_total = sum(p.numel() for p in student.parameters())
+    print(f"[run steps={num_steps}] trainable {n_train / 1e6:.1f}M / {n_total / 1e6:.1f}M params "
+          f"({100 * n_train / n_total:.1f}%)")
+
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr,
                                   betas=(args.adam_beta1, args.adam_beta2),
                                   weight_decay=args.weight_decay, eps=args.adam_eps)
 
@@ -904,6 +1205,8 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
         print(f"[resume] {args.resume_from} -> starting at epoch {start_epoch}")
 
     best_reward = -float("inf")
+    best_epoch = None
+    history = defaultdict(list)
     periodic_ckpts = []
 
     sigmas = karras_sigmas(num_steps + 1, args.sigma_min, args.sigma_max, args.rho,
@@ -951,7 +1254,8 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                 # Group sampling: draw n_groups distinct pairs and roll each out group_size times.
                 # Same z_T, same class, different exploration noise -> a within-group baseline.
                 n_groups = max(1, args.sample_batch_size // max(1, args.group_size))
-                idx = torch.randint(0, pool.n, (n_groups,)).repeat_interleave(
+                n_active = min(args.active_pairs, pool.n) if args.active_pairs > 0 else pool.n
+                idx = torch.randint(0, n_active, (n_groups,)).repeat_interleave(
                     max(1, args.group_size))[:args.sample_batch_size]
                 lat, cls = pool.batch(idx)
                 lat = lat.to(device)
@@ -960,6 +1264,11 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
 
             traj = student_rollout(student, ref_net, lat, labels, sigmas, args.eta, autocast_ctx)
             rewards, parts = reward_fn(traj["images"], target_u8, classes=cls)
+
+            # COCO-style regularizer: 0.5 * ||x_student_final - x_teacher||^2, one scalar per batch.
+            # Computed here, in the no-grad rollout, exactly as latent_kl() is in the SD script.
+            tgt = (to_unit(target_u8).to(device) * 2 - 1)
+            latent_kl_batch = 0.5 * ((traj["images"].float() - tgt).flatten(1) ** 2).sum(-1).mean()
 
             buffers.append({
                 "latents_cur": traj["latents_cur"].cpu(),
@@ -971,6 +1280,7 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                 "keys": (idx.clone() if (not args.online_teacher and args.stat_key == "pair")
                          else cls.clone()),
                 "rewards": rewards.cpu(),
+                "latent_kl": float(latent_kl_batch),
             })
             epoch_rewards.append(rewards.cpu())
             for k, v in parts.items():
@@ -993,6 +1303,15 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
         flat["advantages"] = torch.from_numpy(advantages).float()
         n_samples = flat["latents_cur"].shape[0]
 
+        # Slice the whitened advantages back onto the minibatch they came from, the way the SD
+        # script slices `advantages_all` per rollout batch.
+        cursor = 0
+        for b in buffers:
+            bs = b["rewards"].shape[0]
+            b["advantages"] = flat["advantages"][cursor:cursor + bs]
+            cursor += bs
+        kl_reg = float(np.mean([b["latent_kl"] for b in buffers]))
+
         # =========================================================================== PPO =======
         # NOTE: the student stays in eval() mode on purpose. The EDM ImageNet-64 checkpoint was
         # trained with dropout=0.10, and its UNet blocks apply dropout whenever module.training is
@@ -1005,80 +1324,174 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
         # SD's UNet has no dropout, which is why the COCO branch never hit this.
         student.eval()
         stats = defaultdict(list)
-        for _ in range(args.inner_epochs):
-            # timestep_fraction < 1 trains on a random subset of the trajectory each inner epoch.
-            n_t = max(1, int(round(num_steps * args.timestep_fraction)))
-            pairs = [(s, t) for s in range(n_samples)
-                     for t in (range(num_steps) if n_t == num_steps
-                               else random.sample(range(num_steps), n_t))]
-            random.shuffle(pairs)
+        n_t_cfg = max(1, int(round(num_steps * args.timestep_fraction)))
 
-            optimizer.zero_grad(set_to_none=True)
-            n_minibatches = len(range(0, len(pairs) - args.train_batch_size + 1, args.train_batch_size))
-            stats["opt_steps"] = [n_minibatches / max(1, args.grad_accum)]
-            for mb_i in range(0, len(pairs) - args.train_batch_size + 1, args.train_batch_size):
-                mb = pairs[mb_i:mb_i + args.train_batch_size]
-                s_idx = torch.tensor([p[0] for p in mb])
-                t_idx = torch.tensor([p[1] for p in mb])
+        if args.ppo_style == "coco":
+          # ---- exact port of the SD/COCO update -------------------------------------------
+          # For each inner epoch: walk the rollout minibatches in a shuffled order; inside each,
+          # walk timestep POSITIONS with an independently shuffled timestep order per sample;
+          # accumulate the gradient over every (minibatch, timestep) and take ONE optimizer step.
+          # That is the structure Accelerate produced there with
+          # gradient_accumulation_steps = num_minibatches * num_train_timesteps.
+          sig_cpu = sigmas.detach().cpu()
+          down_cpu = torch.tensor([c[0] for c in step_coeffs])
+          up_cpu = torch.tensor([c[1] for c in step_coeffs])
 
-                x_cur = flat["latents_cur"][s_idx, t_idx].to(device)
-                x_next = flat["latents_next"][s_idx, t_idx].to(device)
-                old_lp = flat["log_probs"][s_idx, t_idx].to(device)
-                ref_mean = flat["ref_means"][s_idx, t_idx].to(device).float()
-                labels = flat["labels"][s_idx].to(device)
-                adv = flat["advantages"][s_idx].to(device)
+          for inner in range(args.inner_epochs):
+                optimizer.zero_grad(set_to_none=True)
+                n_accum = max(1, len(buffers) * n_t_cfg)
+                order = torch.randperm(len(buffers)).tolist()
+                for bi in order:
+                    b = buffers[bi]
+                    B = b["log_probs"].shape[0]
+                    rows = torch.arange(B)
+                    # per-sample shuffled timestep order, as in the SD script's t_perm
+                    t_perm = torch.stack([torch.randperm(num_steps)[:n_t_cfg] for _ in range(B)])
+                    labels_b = b["labels"].to(device)
+                    adv_b = b["advantages"].to(device)
 
-                # All transitions in a minibatch may come from different timesteps; group them.
-                loss_terms, kl_terms, ratios = [], [], []
-                for t in t_idx.unique():
-                    m = (t_idx == t).to(device)
-                    s_from = float(sigmas[int(t)])
-                    s_down, s_up = step_coeffs[int(t)]
+                    for j_idx in range(n_t_cfg):
+                        j = t_perm[:, j_idx]
+                        x_cur = b["latents_cur"][rows, j].to(device)
+                        x_next = b["latents_next"][rows, j].to(device)
+                        old_lp = b["log_probs"][rows, j].to(device)
 
-                    with autocast_ctx():
-                        mean, _ = edm_step_mean(student, x_cur[m], s_from, s_down, labels[m])
-                    mean = mean.float()
+                        with autocast_ctx():
+                            mean, _ = edm_step_mean(student, x_cur, sig_cpu[j], down_cpu[j], labels_b)
+                        mean = mean.float()
+                        lp = gaussian_logprob(x_next, mean, up_cpu[j])
+                        ratio = torch.exp(lp - old_lp)
+                        surr1 = -adv_b * ratio
+                        surr2 = -adv_b * torch.clamp(ratio, 1.0 - args.clip_range,
+                                                     1.0 + args.clip_range)
+                        policy_loss = torch.max(surr1, surr2).mean()
 
-                    lp = gaussian_logprob(x_next[m], mean, s_up)
-                    ratio = torch.exp(lp - old_lp[m])
-                    a = adv[m]
-                    unclipped = -a * ratio
-                    clipped = -a * torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range)
-                    pg = torch.max(unclipped, clipped) * float(step_w[int(t)])
+                        # kl_reg is a constant here, exactly as in the SD script where latent_kl is
+                        # computed inside the no-grad rollout: it shifts the reported loss but
+                        # contributes no gradient.
+                        step_loss = (policy_loss + args.kl_coeff * kl_reg) / n_accum
+                        step_loss.backward()
 
-                    # Both forms measure drift from the reference policy; they differ only in how
-                    # the per-step scale is handled (see --kl_mode).
-                    kl = ((mean - ref_mean[m]) ** 2).mean(dim=(1, 2, 3))
-                    if args.kl_mode == "analytic":
-                        kl = kl / (2 * s_up ** 2)
+                        stats["pg_loss"].append(policy_loss.item())
+                        stats["ratio"].append(ratio.mean().item())
+                        stats["clipfrac"].append(
+                            (torch.abs(ratio - 1.0) > args.clip_range).float().mean().item())
+                        if inner == 0 and bi == order[0] and j_idx == 0:
+                            stats["ratio_t0"] = [ratio.mean().item()]
 
-                    loss_terms.append(pg)
-                    kl_terms.append(kl)
-                    ratios.append(ratio.detach())
+                gn = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                stats["grad_norm"].append(float(gn))
+                stats["opt_steps"] = [float(args.inner_epochs)]
+                stats["kl"] = [kl_reg]
+                global_step += 1
 
-                pg_loss = torch.cat(loss_terms).mean()
-                kl_loss = torch.cat(kl_terms).mean()
-                loss = (pg_loss + args.kl_coeff * kl_loss) / args.grad_accum
-                loss.backward()
+        else:
+            for inner in range(args.inner_epochs):
+                # timestep_fraction < 1 trains on a random subset of the trajectory each inner epoch.
+                n_t = max(1, int(round(num_steps * args.timestep_fraction)))
+                pairs = [(s, t) for s in range(n_samples)
+                         for t in (range(num_steps) if n_t == num_steps
+                                   else random.sample(range(num_steps), n_t))]
+                random.shuffle(pairs)
 
-                stats["pg_loss"].append(pg_loss.item())
-                stats["kl"].append(kl_loss.item())
-                r_mean = torch.cat(ratios).mean().item()
-                stats["ratio"].append(r_mean)
-                if mb_i == 0:
-                    # Before any optimizer step of this epoch the policy is still exactly the one
-                    # that generated the actions, so this MUST be 1.0 to ~1e-6. Anything else means
-                    # the recomputed log-prob comes from a different network than the rollout used
-                    # (dropout left on, precision mismatch, a wrong sigma index...). The epoch-mean
-                    # `ratio` cannot show this, because it mixes in genuine post-update drift.
-                    stats["ratio_t0"] = [r_mean]
+                optimizer.zero_grad(set_to_none=True)
+                n_minibatches = len(range(0, len(pairs) - args.train_batch_size + 1, args.train_batch_size))
+                stats["opt_steps"] = [n_minibatches / max(1, args.grad_accum)]
+                for mb_i in range(0, len(pairs) - args.train_batch_size + 1, args.train_batch_size):
+                    mb = pairs[mb_i:mb_i + args.train_batch_size]
+                    s_idx = torch.tensor([p[0] for p in mb])
+                    t_idx = torch.tensor([p[1] for p in mb])
 
-                if ((mb_i // args.train_batch_size) + 1) % args.grad_accum == 0:
-                    gn = torch.nn.utils.clip_grad_norm_(student.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    stats["grad_norm"].append(float(gn))
-                    global_step += 1
+                    x_cur = flat["latents_cur"][s_idx, t_idx].to(device)
+                    x_next = flat["latents_next"][s_idx, t_idx].to(device)
+                    old_lp = flat["log_probs"][s_idx, t_idx].to(device)
+                    ref_mean = flat["ref_means"][s_idx, t_idx].to(device).float()
+                    labels = flat["labels"][s_idx].to(device)
+                    adv = flat["advantages"][s_idx].to(device)
+
+                    # All transitions in a minibatch may come from different timesteps; group them.
+                    loss_terms, kl_terms, ratios = [], [], []
+                    for t in t_idx.unique():
+                        m = (t_idx == t).to(device)
+                        s_from = float(sigmas[int(t)])
+                        s_down, s_up = step_coeffs[int(t)]
+
+                        with autocast_ctx():
+                            mean, _ = edm_step_mean(student, x_cur[m], s_from, s_down, labels[m])
+                        mean = mean.float()
+
+                        lp = gaussian_logprob(x_next[m], mean, s_up)
+                        ratio = torch.exp(lp - old_lp[m])
+                        a = adv[m]
+                        unclipped = -a * ratio
+                        clipped = -a * torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range)
+                        pg = torch.max(unclipped, clipped) * float(step_w[int(t)])
+
+                        # Both forms measure drift from the reference policy; they differ only in how
+                        # the per-step scale is handled (see --kl_mode).
+                        kl = ((mean - ref_mean[m]) ** 2).mean(dim=(1, 2, 3))
+                        if args.kl_mode == "analytic":
+                            kl = kl / (2 * s_up ** 2)
+
+                        loss_terms.append(pg)
+                        kl_terms.append(kl)
+                        ratios.append(ratio.detach())
+
+                    pg_loss = torch.cat(loss_terms).mean()
+                    kl_loss = torch.cat(kl_terms).mean()
+                    loss = (pg_loss + args.kl_coeff * kl_loss) / args.grad_accum
+                    loss.backward()
+
+                    stats["pg_loss"].append(pg_loss.item())
+                    stats["kl"].append(kl_loss.item())
+                    r_mean = torch.cat(ratios).mean().item()
+                    stats["ratio"].append(r_mean)
+                    if mb_i == 0 and inner == 0:
+                        # Before any optimizer step of this epoch the policy is still exactly the one
+                        # that generated the actions, so this MUST be 1.0 to ~1e-6. Anything else means
+                        # the recomputed log-prob comes from a different network than the rollout used
+                        # (dropout left on, precision mismatch, a wrong sigma index...). The epoch-mean
+                        # `ratio` cannot show this, because it mixes in genuine post-update drift.
+                        stats["ratio_t0"] = [r_mean]
+
+                    if ((mb_i // args.train_batch_size) + 1) % args.grad_accum == 0:
+                        gn = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        stats["grad_norm"].append(float(gn))
+                        global_step += 1
+
+        # ================================================================ DETERMINISTIC EVAL ===
+        eval_metrics = {}
+        if eval_idx is not None:
+            cpu_rng = torch.get_rng_state()
+            cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            torch.manual_seed(args.eval_seed)
+            ev_rewards, ev_parts = [], defaultdict(list)
+            for st in range(0, len(eval_idx), args.sample_batch_size):
+                sub_idx = eval_idx[st:st + args.sample_batch_size]
+                lat_e, cls_e = pool.batch(sub_idx)
+                lab_e = one_hot_labels(cls_e, student.label_dim, device)
+                with torch.no_grad():
+                    img_e = student_sample_det(student, lat_e.to(device), lab_e, sigmas, args.eval_eta)
+                r_e, p_e = reward_fn(img_e, teacher_images[sub_idx], classes=cls_e)
+                ev_rewards.append(r_e)
+                for k, v in p_e.items():
+                    ev_parts[k].append(v)
+            eval_metrics["eval_reward"] = float(torch.cat(ev_rewards).mean())
+            for k, v in ev_parts.items():
+                eval_metrics[f"eval_{k}"] = float(torch.cat(v).mean())
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+
+        if args.lora_rank > 0:
+            eval_metrics["lora_drift"] = lora_drift(student)
+        else:
+            drift_ref = ref_net if ref_net is not None else base_net
+            eval_metrics["param_drift"] = param_drift(student, drift_ref)
 
         # =========================================================================== LOG =======
         log = {
@@ -1096,10 +1509,14 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
             "unique_pairs": int(len(np.unique(keys_all))),
             **{f"reward_{k}": float(torch.cat(v).mean()) for k, v in epoch_parts.items()},
             **{k: float(np.mean(v)) for k, v in stats.items() if len(v)},
+            **eval_metrics,
         }
         print(json.dumps(log), flush=True)
         with open(os.path.join(run_dir, "log.jsonl"), "a") as f:
             f.write(json.dumps(log) + "\n")
+
+        for key in ("epoch", "reward_mean", "reward_std", "pg_loss", "eval_reward"):
+            history[key].append(log.get(key))
         if wandb_run is not None:
             wandb_run.log(log, step=global_step)
 
@@ -1126,20 +1543,38 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                           os.path.join(run_dir, "teacher_reference.png"))
 
         # ---- checkpointing ---------------------------------------------------------------
-        payload = {"model": student.state_dict(), "optimizer": optimizer.state_dict(),
-                   "epoch": epoch, "num_steps": num_steps, "sigmas": sigmas.cpu(),
-                   "reward_mean": log["reward_mean"], "args": vars(args)}
+        meta = {"epoch": epoch, "num_steps": num_steps, "sigmas": sigmas.cpu(),
+                "lora_rank": args.lora_rank, "lora_alpha": args.lora_alpha,
+                "lora_targets": args.lora_targets,
+                "reward_mean": log["reward_mean"], "eval_reward": log.get("eval_reward"),
+                "param_drift": log.get("param_drift"), "args": vars(args)}
+        # best.pt is for evaluation, so it carries weights only: the AdamW state is 2x the model
+        # size (~2.4 GB here) and is useless without resuming the exact same run. last.pt keeps it
+        # so --resume_from still works.
+        best_payload = {"model": student.state_dict(), **meta}
+        payload = {**best_payload, "optimizer": optimizer.state_dict()}
 
-        # "last" is always the newest epoch; "best" is the highest mean reward SO FAR, so a run that
-        # later collapses (reward hacking, KL blow-up) still leaves a usable model behind.
+        # "last" is always the newest epoch; "best" is the highest score SO FAR, written the moment
+        # it is reached -- independent of --save_every -- so a run that later collapses (reward
+        # hacking, drift) still leaves its best model behind.
         torch.save(payload, os.path.join(run_dir, "last.pt"))
-        if log["reward_mean"] > best_reward:
-            best_reward = log["reward_mean"]
-            torch.save(payload, os.path.join(run_dir, "best.pt"))
+        # Select on the deterministic held-out reward when we have it: picking "best" off the noisy
+        # stochastic training reward mostly selects for a lucky epoch.
+        select_on = log.get("eval_reward", log["reward_mean"])
+        if select_on > best_reward:
+            best_reward = select_on
+            best_epoch = epoch
+            best_path = os.path.join(run_dir, "best.pt")
+            torch.save(best_payload, best_path)
             with open(os.path.join(run_dir, "best.json"), "w") as f:
                 json.dump({"epoch": epoch, "reward_mean": best_reward,
                            **{f"reward_{k}": log.get(f"reward_{k}") for k in epoch_parts}}, f, indent=2)
-            print(f"[ckpt] new best at epoch {epoch}: reward {best_reward:.4f}")
+            print(f"[ckpt] new best at epoch {epoch} "
+                  f"({'eval_reward' if 'eval_reward' in log else 'reward'}={best_reward:.4f}) "
+                  f"-> {os.path.abspath(best_path)}")
+
+        save_training_curves(run_dir, history,
+                             "+".join(t.upper() for t in reward_fn.terms), best_epoch)
 
         if args.save_every and (epoch % args.save_every == 0):
             ckpt = os.path.join(run_dir, f"student_ep{epoch:04d}.pt")
