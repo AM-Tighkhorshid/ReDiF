@@ -239,7 +239,7 @@ def parse_args():
                    help="Encoders expect 224px; ImageNet-64 samples are bicubically upsampled.")
 
     # --- logging / io -------------------------------------------------------------------------
-    p.add_argument("--output_dir", type=str, default="./logs")
+    p.add_argument("--output_dir", type=str, default="./edm_logs")
     p.add_argument("--run_name", type=str, default="",
                    help="Sub-directory name. Empty => auto-generated from the reward terms, kl, "
                         "batch size and lr (same convention as the SD branch).")
@@ -257,6 +257,17 @@ def parse_args():
                    help="eta for the eval_reward pass. 0 = deterministic Euler = deployment setting.")
     p.add_argument("--eval_seed", type=int, default=12345,
                    help="Fixed seed for the eval grid, so before/after comparisons are like-for-like.")
+    p.add_argument("--unique_run_dir", type=int, default=1,
+                   help="1 = if the run directory already exists and is non-empty, write to "
+                        "<dir>_run2, _run3, ... instead of appending into the previous run's "
+                        "log.jsonl and overwriting its best.pt. Ignored when --resume_from is set, "
+                        "since a resume is meant to continue in place.")
+    p.add_argument("--count_flops", type=int, default=1,
+                   help="Track training compute. The per-forward cost is measured once at startup "
+                        "(a few seconds); the loop only increments counters, so there is no "
+                        "measurable effect on training speed. Needs fvcore for exact numbers, "
+                        "falls back to torch.profiler, and still reports exact NFE counts if "
+                        "neither can measure the model.")
     p.add_argument("--plot_band", type=str, default="std", choices=["sem", "std", "none"],
                    help="Shaded band around the training reward. sem = standard error of the mean "
                         "(std/sqrt(n)), the one that answers 'is this epoch's move real'. std = the "
@@ -936,6 +947,26 @@ class RewardBank:
         s_p, t_p = hist(s01), hist(t01)
         return -(t_p * (t_p.log() - s_p.log())).sum(-1).sum(-1)
 
+    @torch.no_grad()
+    def flops_per_image(self, budget):
+        """FLOPs to encode ONE image with every active encoder. Measured once."""
+        total = 0.0
+        probe = torch.zeros(1, 3, 64, 64, device=self.device)
+        if self.clip is not None or self.clip_full is not None:
+            px = self._prep(probe, self.CLIP_MEAN, self.CLIP_STD, 224)
+            mod = self.clip_full.vision_model if self.clip_full is not None else self.clip
+            total += budget.calibrate("reward_clip", mod, (px,))
+        if self.dino is not None:
+            px = self._prep(probe, self.IMNET_MEAN, self.IMNET_STD)
+            total += budget.calibrate("reward_dino", self.dino, (px,))
+        if self.pe is not None:
+            px = self._prep(probe, self.pe_mean, self.pe_std, self.pe_size)
+            total += budget.calibrate("reward_pe", self.pe, (px,))
+        if self.lpips is not None:
+            px = self._prep(probe, (0.5,) * 3, (0.5,) * 3, self.lpips_res)
+            total += 2 * budget.calibrate("reward_lpips", self.lpips.net, (px,))  # both branches
+        return total
+
     # -- public API ----------------------------------------------------------------------------
 
     @torch.no_grad()
@@ -1089,6 +1120,71 @@ PLOT_RC = {
 }
 
 
+class FlopBudget:
+    """Training-compute accounting: FLOPs per forward measured ONCE, call counts tracked exactly.
+
+    Why not profile during training: for a diffusion policy the cost per network call is fixed by
+    the architecture and the batch shape, so the only thing that varies is how many calls happen.
+    Measuring once at startup and incrementing integer counters costs nothing in the loop, whereas
+    a profiler attached to every step would add real overhead and tell you the same number.
+
+    Conventions, stated because they are the usual source of 2x disagreements between papers:
+      * FLOPs = 2 x MACs (a multiply-accumulate is counted as two operations).
+      * A backward pass is charged 2x the forward. That is the standard approximation and is exact
+        enough for a compute table; it is not measured.
+      * Counts are per IMAGE, so the numbers do not change if you alter the batch size.
+      * NFE counts only diffusion-network calls, which is the unit the distillation literature
+        reports. Reward encoders are counted separately -- they are not free here (three ViTs per
+        image pair) but they are not part of anyone's NFE budget.
+    """
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.per_forward = {}          # name -> FLOPs for a single-image forward
+        self.calls = defaultdict(float)  # name -> image-forwards, backward-weighted
+        self.nfe = 0.0                 # diffusion-network calls per image, cumulative
+
+    @staticmethod
+    def _measure(module, inputs):
+        """FLOPs for one forward of `module` on `inputs` (batch 1). Returns 0 if unmeasurable."""
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            fca = FlopCountAnalysis(module, inputs)
+            fca.unsupported_ops_warnings(False)
+            fca.uncalled_modules_warnings(False)
+            return 2.0 * float(fca.total())   # fvcore reports MACs
+        except Exception:
+            pass
+        try:
+            with torch.profiler.profile(with_flops=True) as prof:
+                module(*inputs)
+            return float(sum(e.flops for e in prof.key_averages()))
+        except Exception as e:
+            print(f"[flops] could not measure ({e}); install fvcore for FLOP accounting")
+            return 0.0
+
+    def calibrate(self, name, module, inputs):
+        if not self.enabled or name in self.per_forward:
+            return self.per_forward.get(name, 0.0)
+        with torch.no_grad():
+            self.per_forward[name] = self._measure(module, inputs)
+        print(f"[flops] {name}: {self.per_forward[name] / 1e9:.2f} GFLOPs per image-forward")
+        return self.per_forward[name]
+
+    def add(self, name, n_image_forwards, backward=False, is_nfe=False):
+        """backward=True charges 3x (one forward + a backward at 2x)."""
+        if not self.enabled:
+            return
+        self.calls[name] += n_image_forwards * (3.0 if backward else 1.0)
+        if is_nfe:
+            self.nfe += n_image_forwards
+
+    def total_flops(self):
+        per = dict(self.per_forward)
+        per["reward"] = sum(v for k, v in self.per_forward.items() if k.startswith("reward_"))
+        return sum(per.get(k, 0.0) * v for k, v in self.calls.items())
+
+
 # Long reward names push the legend past the right edge of a 4-inch figure. PERCEPTION is the
 # main offender; these are the abbreviations used in the paper text too.
 TERM_ABBREV = {"perception": "PE", "text_image": "TXT", "aesthetic": "AES"}
@@ -1203,6 +1299,23 @@ def save_training_curves(run_dir, hist, reward_label, best_epoch, band="std"):
             plt.close(fig)
 
 
+def unique_run_dir(base, enabled=True):
+    """Return `base`, or `base_run2`, `base_run3`, ... if it already holds a previous run.
+
+    Re-running the same configuration is the normal case here (a seed change, a fixed bug, a longer
+    schedule), and every one of those runs writes log.jsonl by APPENDING. Without this, a second
+    run silently interleaves its epochs into the first run's log and overwrites its curves and
+    best.pt -- and since the epoch counter restarts at 0, the merged file is not even separable
+    afterwards. An empty directory is reused, since nothing can be lost.
+    """
+    if not enabled or not os.path.isdir(base) or not os.listdir(base):
+        return base
+    i = 2
+    while os.path.exists(f"{base}_run{i}"):
+        i += 1
+    return f"{base}_run{i}"
+
+
 def save_grid(images_pm1, path, nrow=8):
     try:
         import torchvision
@@ -1219,8 +1332,10 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
     but reuses the same pool and the same cached teacher targets, so the 4-step vs 8-step comparison
     differs only in the discretisation.
     """
-    run_dir = os.path.join(args.output_dir, args.run_name, f"steps{num_steps}")
+    run_dir = unique_run_dir(os.path.join(args.output_dir, args.run_name, f"steps{num_steps}"),
+                             enabled=bool(args.unique_run_dir) and not args.resume_from)
     os.makedirs(run_dir, exist_ok=True)
+    print(f"[run steps={num_steps}] writing to {os.path.abspath(run_dir)}")
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump({**vars(args), "num_steps": num_steps}, f, indent=2)
 
@@ -1304,6 +1419,19 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
     else:
         step_w = np.ones_like(ups)
 
+    budget = FlopBudget(enabled=bool(args.count_flops))
+    if budget.enabled:
+        probe_x = torch.zeros(1, student.img_channels, student.img_resolution,
+                              student.img_resolution, device=device)
+        probe_s = torch.full((1,), 1.0, device=device)
+        probe_l = one_hot_labels(torch.zeros(1, dtype=torch.long), student.label_dim, device)
+        budget.calibrate("unet", student, (probe_x, probe_s, probe_l))
+        reward_fn.flops_per_image(budget)
+        # The teacher targets were paid for once, before this run; charge them here so the compute
+        # table reflects the true end-to-end cost of producing this student.
+        if teacher_images is not None:
+            budget.add("unet", len(teacher_images) * (2 * args.teacher_steps - 1))
+
     wandb_run = None
     if args.use_wandb:
         import wandb
@@ -1341,7 +1469,12 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                 target_u8 = teacher_images[idx]
 
             traj = student_rollout(student, ref_net, lat, labels, sigmas, args.eta, autocast_ctx)
+            B = traj["images"].shape[0]
+            budget.add("unet", B * num_steps, is_nfe=True)          # student policy rollout
+            if ref_net is not None:
+                budget.add("unet", B * num_steps)                    # frozen reference, same states
             rewards, parts = reward_fn(traj["images"], target_u8, classes=cls)
+            budget.add("reward", 2 * B)                              # student image + teacher image
 
             # COCO-style regularizer: 0.5 * ||x_student_final - x_teacher||^2, one scalar per batch.
             # Computed here, in the no-grad rollout, exactly as latent_kl() is in the SD script.
@@ -1449,6 +1582,7 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                         # contributes no gradient.
                         step_loss = (policy_loss + args.kl_coeff * kl_reg) / n_accum
                         step_loss.backward()
+                        budget.add("unet", x_cur.shape[0], backward=True)
 
                         stats["pg_loss"].append(policy_loss.item())
                         stats["ratio"].append(ratio.mean().item())
@@ -1517,6 +1651,7 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                         kl_terms.append(kl)
                         ratios.append(ratio.detach())
 
+                    budget.add("unet", len(mb), backward=True)
                     pg_loss = torch.cat(loss_terms).mean()
                     kl_loss = torch.cat(kl_terms).mean()
                     loss = (pg_loss + args.kl_coeff * kl_loss) / args.grad_accum
@@ -1554,7 +1689,9 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                 lab_e = one_hot_labels(cls_e, student.label_dim, device)
                 with torch.no_grad():
                     img_e = student_sample_det(student, lat_e.to(device), lab_e, sigmas, args.eval_eta)
+                budget.add("unet", len(sub_idx) * num_steps)
                 r_e, p_e = reward_fn(img_e, teacher_images[sub_idx], classes=cls_e)
+                budget.add("reward", 2 * len(sub_idx))
                 ev_rewards.append(r_e)
                 for k, v in p_e.items():
                     ev_parts[k].append(v)
@@ -1564,6 +1701,10 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
+
+        if budget.enabled:
+            eval_metrics["nfe_cum"] = budget.nfe
+            eval_metrics["pflops_cum"] = budget.total_flops() / 1e15
 
         if args.lora_rank > 0:
             eval_metrics["lora_drift"] = lora_drift(student)
@@ -1673,6 +1814,10 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
         wandb_run.finish()
     del student, ref_net, optimizer
     torch.cuda.empty_cache()
+    if budget.enabled:
+        print(f"[flops] total {budget.total_flops() / 1e15:.3f} PFLOPs "
+              f"({budget.nfe:.0f} student NFE-images); breakdown: "
+              + ", ".join(f"{k}={v:.3g} img-fwd" for k, v in budget.calls.items()))
     print(f"[done] steps={num_steps}, best reward {best_reward:.4f} -> {run_dir}/best.pt")
 
 
