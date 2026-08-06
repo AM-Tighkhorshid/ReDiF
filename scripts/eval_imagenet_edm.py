@@ -96,7 +96,7 @@ def parse_args():
                    help="real = FID against actual ImageNet images (reported for BOTH student and "
                         "teacher). teacher = fallback when no ImageNet data is available; then only "
                         "the student-vs-teacher distance is meaningful.")
-    p.add_argument("--real_dir", type=str, default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/Dataset/imagenet_val_64",
+    p.add_argument("--real_dir", type=str, default="diffusion_distillation/Dataset/imagenet_val_64",
                    help="Folder of ImageNet images, globbed recursively (e.g. the val/ directory).")
     p.add_argument("--num_real", type=int, default=10000,
                    help="How many real images to use. Independent of the number of generated samples: "
@@ -456,13 +456,39 @@ def main():
         results["class_acc_teacher"] = class_accuracy(args.classifier, teacher_u8, classes, device)
 
     # ---- report -----------------------------------------------------------------------------
-    path = os.path.join(out_dir, f"metrics_steps{num_steps}_{args.ref}_{split}.json")
+    # Everything lands next to the .pt being evaluated, in three forms:
+    #   metrics_<ckpt>_...json  one file per (checkpoint, config) -- the checkpoint name is in the
+    #                           filename so evaluating ep0000 and best.pt does not overwrite one
+    #                           with the other, which is the whole point of comparing them.
+    #   eval_log.jsonl          append-only, one line per evaluation, same format as the training
+    #                           log.jsonl so both can be read back with the same parser.
+    #   eval_results.txt        human-readable, appended, for reading over ssh.
+    import datetime
+    ckpt_stem = os.path.splitext(os.path.basename(args.student_ckpt))[0]
+    results["checkpoint"] = ckpt_stem
+    results["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    path = os.path.join(out_dir, f"metrics_{ckpt_stem}_steps{num_steps}_{args.ref}_{split}.json")
     with open(path, "w") as f:
         json.dump(results, f, indent=2)
+
+    log_path = os.path.join(out_dir, "eval_log.jsonl")
+    with open(log_path, "a") as f:
+        f.write(json.dumps(results) + "\n")
+
+    txt_path = os.path.join(out_dir, "eval_results.txt")
+    with open(txt_path, "a") as f:
+        f.write(f"\n=== {results['timestamp']} | {ckpt_stem} | epoch {results['epoch']} | "
+                f"{num_steps} steps | eta {args.student_eta} | ref={args.ref} | split={split} "
+                f"| n={n_eval} ===\n")
+        for k, v in results.items():
+            f.write(f"  {k}: {v:.6f}\n" if isinstance(v, float) else f"  {k}: {v}\n")
+
     print("\n=== results ===")
     for k, v in results.items():
         print(f"  {k}: {v:.6f}" if isinstance(v, float) else f"  {k}: {v}")
     print(f"\nwritten to {path}")
+    print(f"appended to {log_path} and {txt_path}")
 
 
 if __name__ == "__main__":

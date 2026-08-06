@@ -239,7 +239,7 @@ def parse_args():
                    help="Encoders expect 224px; ImageNet-64 samples are bicubically upsampled.")
 
     # --- logging / io -------------------------------------------------------------------------
-    p.add_argument("--output_dir", type=str, default="./edm_logs")
+    p.add_argument("--output_dir", type=str, default="./logs")
     p.add_argument("--run_name", type=str, default="",
                    help="Sub-directory name. Empty => auto-generated from the reward terms, kl, "
                         "batch size and lr (same convention as the SD branch).")
@@ -257,6 +257,11 @@ def parse_args():
                    help="eta for the eval_reward pass. 0 = deterministic Euler = deployment setting.")
     p.add_argument("--eval_seed", type=int, default=12345,
                    help="Fixed seed for the eval grid, so before/after comparisons are like-for-like.")
+    p.add_argument("--plot_band", type=str, default="std", choices=["sem", "std", "none"],
+                   help="Shaded band around the training reward. sem = standard error of the mean "
+                        "(std/sqrt(n)), the one that answers 'is this epoch's move real'. std = the "
+                        "per-sample spread, which mostly measures how much pair difficulty varies "
+                        "and is ~5x wider. none = no band.")
     p.add_argument("--allow_tf32", type=int, default=1)
     p.add_argument("--seed", type=int, default=24)
     p.add_argument("--use_wandb", action="store_true")
@@ -532,6 +537,27 @@ def apply_lora(net, rank, alpha, target_regex):
         setattr(parent, attr, LoRAWrapper(module, rank, alpha))
         wrapped.append(name)
     return wrapped
+
+
+def apply_lora_from_state_dict(net, state_dict, alpha=0):
+    """Rebuild the exact adapter layout described by a checkpoint's state_dict.
+
+    Safer than trusting a `lora_rank` field in the checkpoint metadata: the weights themselves are
+    self-describing, so this works for checkpoints written before that field existed and can never
+    disagree with what is actually stored. Returns the list of wrapped module names.
+    """
+    names = sorted({k[:-2] for k in state_dict if k.endswith(".A")})
+    if not names:
+        return []
+    rank = state_dict[names[0] + ".A"].shape[0]
+    for name in names:
+        parent_name, _, attr = name.rpartition(".")
+        parent = net.get_submodule(parent_name) if parent_name else net
+        base = getattr(parent, attr)
+        if isinstance(base, LoRAWrapper):
+            continue
+        setattr(parent, attr, LoRAWrapper(base, rank, alpha or rank))
+    return names
 
 
 @torch.no_grad()
@@ -1063,12 +1089,32 @@ PLOT_RC = {
 }
 
 
-def save_training_curves(run_dir, hist, reward_label, best_epoch):
-    """Publication-style loss / reward curves, written next to the checkpoints.
+# Long reward names push the legend past the right edge of a 4-inch figure. PERCEPTION is the
+# main offender; these are the abbreviations used in the paper text too.
+TERM_ABBREV = {"perception": "PE", "text_image": "TXT", "aesthetic": "AES"}
 
-    Same styling as the SD branch so both sets of figures can go in one paper. Rewritten every
-    epoch (cheap) rather than only at the end, so a run that is killed early still leaves usable
-    figures behind. Uses the Agg backend explicitly: this script normally runs headless over SSH.
+
+def short_reward_label(terms):
+    return "+".join(TERM_ABBREV.get(t, t.upper()) for t in terms)
+
+
+def _legend_fontsize(labels, base=9.0, chars_per_pt=4.6):
+    """Shrink the legend font just enough for the longest entry to fit inside the axes.
+
+    A fixed size works until someone runs a four- or five-term reward, at which point the longest
+    label silently overhangs the frame. Scaling by the longest label makes that impossible without
+    making every other figure smaller than it needs to be.
+    """
+    longest = max((len(l) for l in labels), default=0)
+    return float(np.clip(base * (chars_per_pt * 10.0) / max(longest, 1), 6.5, base))
+
+
+def save_training_curves(run_dir, hist, reward_label, best_epoch, band="std"):
+    """Publication-style loss / reward / drift curves, written next to the checkpoints.
+
+    Single shared axis for both reward curves: they are the same quantity measured under different
+    sampling noise (eta > 0 during rollout, eta = 0 held-out), so the vertical gap between them is
+    itself meaningful and worth showing directly.
     """
     try:
         import matplotlib
@@ -1100,29 +1146,61 @@ def save_training_curves(run_dir, hist, reward_label, best_epoch):
         # -- Reward curve ----------------------------------------------------------------------
         r = np.asarray(hist["reward_mean"], dtype=np.float64)
         sd = np.asarray(hist["reward_std"], dtype=np.float64)
+        n = np.asarray([max(1, v or 1) for v in hist["n_samples"]], dtype=np.float64)
+        err = sd / np.sqrt(n) if band == "sem" else sd
 
         fig, ax = plt.subplots(figsize=(4.0, 3.0))
-        ax.plot(epochs, r, color="#1f3fbf", label=f"Train reward ({reward_label})")
-        ax.fill_between(epochs, r - sd, r + sd, color="#a9bdf2", alpha=0.4, linewidth=0,
-                        label=r"$\pm 1$ std")
-        # The deterministic held-out curve belongs on the same axes: identical reward terms, so the
-        # same units. The offset between the two lines is purely the cost of the exploration noise.
+        # Handles are collected in draw order and passed to legend() explicitly: the band is listed
+        # first so the wide light swatch sits above the line entries instead of between them.
+        handles = []
+        if band != "none":
+            handles.append(ax.fill_between(
+                epochs, r - err, r + err, color="#a9bdf2", alpha=0.4, linewidth=0,
+                label=r"$\pm 1$ s.e.m." if band == "sem" else r"$\pm 1$ std"))
+        handles += ax.plot(epochs, r, color="#1f3fbf", label=f"Train reward ({reward_label})")
         if any(v is not None for v in hist["eval_reward"]):
-            ev = np.asarray([np.nan if v is None else v for v in hist["eval_reward"]], dtype=np.float64)
-            ax.plot(epochs, ev, color="#2e8b57", label="Held-out reward (eta=0)")
+            ev = np.asarray([np.nan if v is None else v for v in hist["eval_reward"]],
+                            dtype=np.float64)
+            handles += ax.plot(epochs, ev, color="#2e8b57", label="Held-out reward (eta=0)")
         if best_epoch is not None:
-            ax.axvline(best_epoch, color="#B94F4F", linestyle="--", linewidth=1.0,
-                       label=f"Best epoch ({best_epoch})")
+            handles.append(ax.axvline(best_epoch, color="#B94F4F", linestyle="--", linewidth=1.0,
+                                      label=f"Best epoch ({best_epoch})"))
+
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Reward")
         ax.grid(True, linewidth=0.4, alpha=0.4)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        ax.legend(frameon=False, loc="best")
+        # Anchored one text line below the top of the axes rather than left to loc="best", which
+        # parks the block over whichever curve happens to run along the top.
+        labels = [h.get_label() for h in handles]
+        ax.legend(handles=handles, labels=labels, frameon=False, loc="upper left",
+                  bbox_to_anchor=(0.01, 0.90), fontsize=_legend_fontsize(labels))
         fig.tight_layout()
         for ext in ("png", "pdf"):
             fig.savefig(os.path.join(run_dir, f"reward_curve.{ext}"))
         plt.close(fig)
+
+        # -- Drift curve -----------------------------------------------------------------------
+        # How far the policy actually moved. Reward curves alone cannot distinguish "converged"
+        # from "never left the initialisation"; this can.
+        drift = [v for v in hist["drift"] if v is not None]
+        if len(drift) == len(epochs) and any(drift):
+            fig, ax = plt.subplots(figsize=(4.0, 3.0))
+            ax.plot(epochs, drift, color="#6a3d9a", label=hist["drift_label"][-1])
+            if best_epoch is not None:
+                ax.axvline(best_epoch, color="#B94F4F", linestyle="--", linewidth=1.0,
+                           label=f"Best epoch ({best_epoch})")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Relative parameter change")
+            ax.grid(True, linewidth=0.4, alpha=0.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.legend(frameon=False, loc="best")
+            fig.tight_layout()
+            for ext in ("png", "pdf"):
+                fig.savefig(os.path.join(run_dir, f"drift_curve.{ext}"))
+            plt.close(fig)
 
 
 def save_grid(images_pm1, path, nrow=8):
@@ -1517,6 +1595,11 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
 
         for key in ("epoch", "reward_mean", "reward_std", "pg_loss", "eval_reward"):
             history[key].append(log.get(key))
+        history["n_samples"].append(n_samples)
+        # LoRA runs report lora_drift, full fine-tunes report param_drift; plot whichever exists.
+        history["drift"].append(log.get("lora_drift", log.get("param_drift")))
+        history["drift_label"].append("LoRA delta / base weight norm" if "lora_drift" in log
+                                      else "Parameter drift (RMS, relative)")
         if wandb_run is not None:
             wandb_run.log(log, step=global_step)
 
@@ -1573,8 +1656,8 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
                   f"({'eval_reward' if 'eval_reward' in log else 'reward'}={best_reward:.4f}) "
                   f"-> {os.path.abspath(best_path)}")
 
-        save_training_curves(run_dir, history,
-                             "+".join(t.upper() for t in reward_fn.terms), best_epoch)
+        save_training_curves(run_dir, history, short_reward_label(reward_fn.terms), best_epoch,
+                             band=args.plot_band)
 
         if args.save_every and (epoch % args.save_every == 0):
             ckpt = os.path.join(run_dir, f"student_ep{epoch:04d}.pt")
