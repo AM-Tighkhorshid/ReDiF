@@ -239,7 +239,7 @@ def parse_args():
                    help="Encoders expect 224px; ImageNet-64 samples are bicubically upsampled.")
 
     # --- logging / io -------------------------------------------------------------------------
-    p.add_argument("--output_dir", type=str, default="./edm_logs")
+    p.add_argument("--output_dir", type=str, default="./logs")
     p.add_argument("--run_name", type=str, default="",
                    help="Sub-directory name. Empty => auto-generated from the reward terms, kl, "
                         "batch size and lr (same convention as the SD branch).")
@@ -1179,6 +1179,23 @@ class FlopBudget:
         if is_nfe:
             self.nfe += n_image_forwards
 
+    def summary(self, epoch=None):
+        """Full accounting, JSON-serialisable, for flops.json in the run directory."""
+        per = dict(self.per_forward)
+        per["reward"] = sum(v for k, v in self.per_forward.items() if k.startswith("reward_"))
+        return {
+            "epoch": epoch,
+            "total_pflops": self.total_flops() / 1e15,
+            "student_nfe_images": self.nfe,
+            "gflops_per_image_forward": {k: v / 1e9 for k, v in sorted(self.per_forward.items())},
+            "image_forwards": {k: v for k, v in sorted(self.calls.items())},
+            "pflops_by_component": {k: per.get(k, 0.0) * v / 1e15
+                                    for k, v in sorted(self.calls.items())},
+            "notes": ("FLOPs = 2 x MACs; backward charged at 2x forward; counts are per image. "
+                      "'unet' includes the one-off teacher-cache generation, which dominates the "
+                      "total -- subtract it for the marginal cost of the RL stage alone."),
+        }
+
     def total_flops(self):
         per = dict(self.per_forward)
         per["reward"] = sum(v for k, v in self.per_forward.items() if k.startswith("reward_"))
@@ -1799,6 +1816,12 @@ def train_student(args, num_steps, base_net, pool, teacher_images, reward_fn, de
 
         save_training_curves(run_dir, history, short_reward_label(reward_fn.terms), best_epoch,
                              band=args.plot_band)
+
+        if budget.enabled:
+            # Rewritten every epoch rather than only at the end, so a killed run still leaves its
+            # compute accounting behind -- same reasoning as the curves.
+            with open(os.path.join(run_dir, "flops.json"), "w") as f:
+                json.dump(budget.summary(epoch), f, indent=2)
 
         if args.save_every and (epoch % args.save_every == 0):
             ckpt = os.path.join(run_dir, f"student_ep{epoch:04d}.pt")
