@@ -88,7 +88,7 @@ def parse_args():
     p.add_argument("--sigma_min", type=float, default=0.002)
     p.add_argument("--sigma_max", type=float, default=80.0)
     p.add_argument("--rho", type=float, default=7.0)
-    p.add_argument("--eta", type=float, default=1.0,
+    p.add_argument("--eta", type=float, default=1,
                    help="Exploration level of the ancestral step (analogue of DDIM eta). eta=0 is fully "
                         "deterministic => zero-variance policy => no policy gradient at all. eta=1 is the "
                         "fully ancestral (DDPM-like) step, which with only 4 steps throws away almost all of "
@@ -239,7 +239,7 @@ def parse_args():
                    help="Encoders expect 224px; ImageNet-64 samples are bicubically upsampled.")
 
     # --- logging / io -------------------------------------------------------------------------
-    p.add_argument("--output_dir", type=str, default="./logs")
+    p.add_argument("--output_dir", type=str, default="./edm_logs")
     p.add_argument("--run_name", type=str, default="",
                    help="Sub-directory name. Empty => auto-generated from the reward terms, kl, "
                         "batch size and lr (same convention as the SD branch).")

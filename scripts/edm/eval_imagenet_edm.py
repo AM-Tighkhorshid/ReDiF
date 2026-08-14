@@ -96,7 +96,7 @@ def parse_args():
                    help="real = FID against actual ImageNet images (reported for BOTH student and "
                         "teacher). teacher = fallback when no ImageNet data is available; then only "
                         "the student-vs-teacher distance is meaningful.")
-    p.add_argument("--real_dir", type=str, default="diffusion_distillation/Dataset/imagenet_val_64",
+    p.add_argument("--real_dir", type=str, default="/media/external20/amirhossein_tighkhorshid/diffusion_distillation/Dataset/imagenet_val_64",
                    help="Folder of ImageNet images, globbed recursively (e.g. the val/ directory).")
     p.add_argument("--num_real", type=int, default=10000,
                    help="How many real images to use. Independent of the number of generated samples: "
